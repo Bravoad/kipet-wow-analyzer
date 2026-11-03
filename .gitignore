@@ -1,13 +1,27 @@
+# Локальная конфигурация и ключи
 .env
 .env.*
 !.env.example
-web/node_modules/
-tests/contract/node_modules/
-web/dist/
-web/test-results/
-web/playwright-report/
+
+# Зависимости и сборка
+node_modules/
+/web/dist/
 bin/
 *.exe
+
+# Результаты тестов и локального запуска
+/web/test-results/
+/web/playwright-report/
 coverage.out
+*.log
+/artifacts/
+
+# Локальные копии базы данных
+*.dump
+*.pgdump
+/backups/
+
+# Настройки IDE и файлы операционной системы
+.idea/
 .DS_Store
-artifacts/
+Thumbs.db
