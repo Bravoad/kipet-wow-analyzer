@@ -1,4 +1,4 @@
-import type { ApiFailure, CharacterKey, Envelope, Locale } from './types.ts';
+import type { ApiFailure, CharacterKey, Envelope, Locale, Meta } from './types.ts';
 
 export class ApiError extends Error {
   status: number;
@@ -8,6 +8,15 @@ export class ApiError extends Error {
 
 export function characterPath(key: CharacterKey, locale: Locale, section = '') {
   return `/api/v1/characters/${encodeURIComponent(key.region)}/${encodeURIComponent(key.realm)}/${encodeURIComponent(key.name)}${section ? `/${section}` : ''}?locale=${locale}`;
+}
+
+export function matchesCharacterSnapshot(
+  response: { data: { character_id: string } | null; meta: Pick<Meta, 'snapshot_id'> },
+  characterID: string,
+  snapshotID: string | null,
+) {
+  return !!snapshotID && response?.meta?.snapshot_id === snapshotID &&
+    (response.data === null || response.data?.character_id === characterID);
 }
 
 export function nextPollDelay(attempt: number, suggestedSeconds: number | null, retryAfterSeconds: number | null = null) {
@@ -23,11 +32,15 @@ export async function request<T>(url: string, options: RequestInit = {}): Promis
     throw new ApiError(0, { code: 'NETWORK_ERROR', message: 'Connection unavailable', retryable: true, retry_after_seconds: null, job_id: null, fields: [] });
   }
   const retryHeader = response.headers.get('Retry-After');
-  const retryAfter = retryHeader ? (/^\d+$/.test(retryHeader) ? Number(retryHeader) : Math.max(1, Math.ceil((Date.parse(retryHeader) - Date.now()) / 1000))) : null;
+  const parsedRetryAfter = retryHeader ? (/^\d+$/.test(retryHeader) ? Number(retryHeader) : Math.max(1, Math.ceil((Date.parse(retryHeader) - Date.now()) / 1000))) : null;
+  const retryAfter = Number.isFinite(parsedRetryAfter) ? parsedRetryAfter : null;
   let body: T & { error?: ApiFailure };
   try { body = await response.json(); }
   catch { throw new ApiError(response.status, { code: 'INVALID_RESPONSE', message: 'Invalid response', retryable: true, retry_after_seconds: retryAfter, job_id: null, fields: [] }); }
-  if (!response.ok) throw new ApiError(response.status, body.error ?? { code: 'INFRASTRUCTURE_UNAVAILABLE', message: 'Service unavailable', retryable: true, retry_after_seconds: retryAfter, job_id: null, fields: [] });
+  if (!response.ok) {
+    const detail = body?.error ?? { code: 'INFRASTRUCTURE_UNAVAILABLE', message: 'Service unavailable', retryable: true, retry_after_seconds: null, job_id: null, fields: [] };
+    throw new ApiError(response.status, retryAfter === null ? detail : { ...detail, retry_after_seconds: Math.max(detail.retry_after_seconds ?? 0, retryAfter) });
+  }
   return { body, status: response.status, retryAfter };
 }
 

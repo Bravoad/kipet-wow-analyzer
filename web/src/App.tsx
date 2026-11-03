@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useEffectEvent, useRef, useState } from 'react';
 import { dictionary, formatDate, number } from './i18n.ts';
 import { Icon } from './components/Icon.tsx';
 import { RealmPicker } from './components/RealmPicker.tsx';
@@ -16,8 +16,8 @@ import { RaiderWorkspace } from './components/RaiderWorkspace.tsx';
 import { RaiderComparisonWorkspace, RaiderGuildWorkspace } from './components/RaiderSocialWorkspace.tsx';
 import { socialMessages } from './shared/socialMessages.ts';
 import { combatMessages } from './shared/combatMessages.ts';
-import { request } from './shared/api.ts';
 import type { ApiError } from './shared/api.ts';
+import { loadRuntime, runtimeRetrySeconds } from './shared/runtime.ts';
 import { isRaiderSocialRoute } from './shared/raider.ts';
 import type { AnalysisContent, CharacterKey, Locale, Region, Runtime, SourceSection, Tab } from './shared/types.ts';
 
@@ -62,7 +62,11 @@ export default function App() {
   const [realm, setRealm] = useState<RealmSelection | null>(initialKey.current ? { slug: initialKey.current.realm, name: initialKey.current.realm } : null);
   const [name, setName] = useState(initialKey.current?.name ?? '');
   const [validation, setValidation] = useState<'realm' | 'name' | null>(null);
+  const [realmPickerRevision, setRealmPickerRevision] = useState(0);
   const [runtime, setRuntime] = useState<Runtime | null>(null);
+  const [runtimeAttempt, setRuntimeAttempt] = useState(0);
+  const [runtimeRetryAt, setRuntimeRetryAt] = useState<number | null>(null);
+  const allowDefaultWorkspace = useRef(true);
   const [tab, setTab] = useState<Tab>(() => tabs.some(item => item.id === new URLSearchParams(location.search).get('tab')) ? new URLSearchParams(location.search).get('tab') as Tab : 'overview');
   const [cooldown, setCooldown] = useState(0);
   const [analysisContent, setAnalysisContent] = useState<AnalysisContent>(contentFromURL);
@@ -75,6 +79,7 @@ export default function App() {
   const raiderVisible = runtime?.raiderio_enabled || view === 'raiderio';
   const raiderSocial = isRaiderSocialRoute(routeSearch, runtime);
   const socialWorkspace = view === 'guilds' || view === 'comparison';
+  const requiresRuntime = view === 'reports' || view === 'raiderio' || (socialWorkspace && raiderSocial);
   const legacyCharacterLabel = runtime?.raiderio_enabled && demo ? (locale === 'ru-RU' ? 'Демопрофиль' : 'Demo profile') : combatText.character;
   const sourceLabel = demo ? t.sourceFixture : runtime || profileMeta?.source === 'blizzard' ? t.sourceBlizzard : t.sourceUnknown;
 
@@ -84,27 +89,58 @@ export default function App() {
   }, [locale]);
   useEffect(() => {
     const controller = new AbortController();
-    void request<Runtime | { data: Runtime }>('/api/v1/runtime', { signal: controller.signal }).then(result => {
-      const next = 'data' in result.body ? result.body.data : result.body;
+    void loadRuntime(controller.signal).then(next => {
+      if (controller.signal.aborted) return;
       setRuntime(next);
-      if (next.raiderio_enabled && !location.search) {
+      if (next.raiderio_enabled && allowDefaultWorkspace.current && !location.search) {
         history.replaceState(null, '', '?view=raiderio');
+        setRouteSearch(location.search);
         setView('raiderio');
       }
-    }).catch(() => {});
+    }).catch(error => {
+      if (controller.signal.aborted) return;
+      const seconds = runtimeRetrySeconds(error);
+      setRuntimeRetryAt(seconds > 0 ? Date.now() + seconds * 1000 : 0);
+    });
     return () => controller.abort();
-  }, []);
+  }, [runtimeAttempt]);
+  useEffect(() => {
+    if (!runtimeRetryAt) return;
+    const timer = setInterval(() => {
+      if (Date.now() >= runtimeRetryAt) setRuntimeRetryAt(0);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [runtimeRetryAt]);
+  const onPopState = useEffectEvent(() => {
+    allowDefaultWorkspace.current = false;
+    const nextWorkspace = workspaceFromURL();
+    setView(nextWorkspace);
+    setRouteSearch(location.search);
+    if (nextWorkspace !== 'character') return;
+    const key = keyFromURL();
+    setValidation(null);
+    if (!key) {
+      character.clearCharacter();
+      setRegion('eu');
+      setRealm(null);
+      setRealmPickerRevision(revision => revision + 1);
+      setName('');
+      setTab('overview');
+      setAnalysisContent('general_pve');
+      setCooldown(0);
+      return;
+    }
+    const nextTab = new URLSearchParams(location.search).get('tab');
+    setTab(tabs.some(item => item.id === nextTab) ? nextTab as Tab : 'overview');
+    setAnalysisContent(contentFromURL());
+    setRegion(key.region);
+    setRealm({ slug: key.realm, name: key.realm });
+    setName(key.name);
+    void character.load(key);
+  });
   useEffect(() => {
     if (initialKey.current) void character.load(initialKey.current);
-    const pop = () => {
-      const nextWorkspace = workspaceFromURL();
-      setView(nextWorkspace);
-      setRouteSearch(location.search);
-      const key = nextWorkspace === 'character' ? keyFromURL() : null;
-      const nextTab = new URLSearchParams(location.search).get('tab');
-      setTab(tabs.some(item => item.id === nextTab) ? nextTab as Tab : 'overview'); setAnalysisContent(contentFromURL());
-      if (key) { setRegion(key.region); setRealm({ slug: key.realm, name: key.realm }); setName(key.name); void character.load(key); }
-    };
+    const pop = () => onPopState();
     window.addEventListener('popstate', pop);
     return () => window.removeEventListener('popstate', pop);
     // The hook handles locale changes and cancellation independently.
@@ -123,6 +159,7 @@ export default function App() {
   }, [character.error]);
 
   const open = (key: CharacterKey) => {
+    allowDefaultWorkspace.current = false;
     setView('character'); setRegion(key.region); setName(key.name); setValidation(null); setTab('overview');
     if (key.realm !== realm?.slug || key.region !== region) setRealm({ slug: key.realm, name: key.realm });
     writeURL(key, 'overview'); void character.load(key);
@@ -140,6 +177,7 @@ export default function App() {
   };
   const selectWorkspace = (next: Workspace) => {
     if (next === view) return;
+    allowDefaultWorkspace.current = false;
     rememberWorkspace();
     setView(next);
     if (next === 'reports') history.pushState(null, '', reportRoute.current);
@@ -159,6 +197,7 @@ export default function App() {
     setView('comparison');
   };
   const selectTab = (next: Tab) => {
+    allowDefaultWorkspace.current = false;
     rememberWorkspace();
     setView('character');
     setTab(next);
@@ -189,14 +228,23 @@ export default function App() {
             <Icon name="arrow" size={14}/>
           </a>
         </div>}
-        {view === 'raiderio' ? <RaiderWorkspace runtime={runtime} locale={locale}/>
+        {runtimeRetryAt !== null && <div className="analysis-state panel" role="alert">
+          <Icon name="info" size={20}/>
+          <div><strong>{t.runtimeError}</strong>{runtimeRetryAt > 0 && <p>{t.runtimeRetryWait}</p>}</div>
+          <button type="button" className="button-secondary" disabled={runtimeRetryAt > 0} onClick={() => {
+            setRuntimeRetryAt(null);
+            setRuntimeAttempt(attempt => attempt + 1);
+          }}>{t.runtimeRetry}</button>
+        </div>}
+        {runtimeRetryAt !== null && requiresRuntime ? null
+          : view === 'raiderio' ? <RaiderWorkspace runtime={runtime} locale={locale}/>
           : view === 'reports' ? <CombatWorkspace runtime={runtime} locale={locale}/>
           : view === 'guilds' ? (raiderSocial ? <RaiderGuildWorkspace runtime={runtime} locale={locale}/> : <GuildWorkspace runtime={runtime} locale={locale} onCompare={compareMembers}/>)
           : view === 'comparison' ? (raiderSocial ? <RaiderComparisonWorkspace runtime={runtime} locale={locale}/> : <ComparisonWorkspace runtime={runtime} locale={locale}/>)
           : <>
         <section className={`hero ${profile ? 'hero-compact' : ''}`}><div className="hero-copy"><div className="eyebrow"><span className="gold-line"/>{t.heroTop}</div><h1>{profile ? t.profileTitle : t.heroTitle}</h1><p>{profile ? t.profileSubtitle : t.heroDescription}</p></div><div className="hero-symbol" aria-hidden="true"><Compass/></div></section>
 
-        <section className="search-panel panel" aria-label={t.search}><form onSubmit={search} noValidate><div className="search-region field"><label htmlFor="region">{t.region}</label><div className="select-wrap"><select id="region" value={region} onChange={event => { setRegion(event.target.value as Region); setRealm(null); setValidation(null); }}><option value="eu">Europe · EU</option><option value="us">Americas · US</option></select><Icon name="chevron" size={14}/></div></div><div className="search-realm field"><label htmlFor="realm">{t.realm}</label><RealmPicker region={region} locale={locale} selected={realm} onChange={setRealm} t={t} invalid={validation === 'realm'}/></div><div className="search-name field"><label htmlFor="character-name">{t.name}</label><div className="input-icon"><Icon name="shield" size={17}/><input id="character-name" value={name} onChange={event => { setName(event.target.value); setValidation(null); }} autoComplete="off" placeholder={t.namePlaceholder} aria-invalid={validation === 'name'} aria-describedby={validation === 'name' ? 'search-validation' : undefined}/></div></div><button type="submit" className="button-primary search-button" disabled={character.busy || cooldown > 0}><Icon name={character.busy ? 'refresh' : 'search'} size={18} className={character.busy ? 'spinning' : ''}/><span>{character.busy ? t.searching : t.search}</span><Icon name="arrow" size={16}/></button></form>{validation && <p className="validation-message" id="search-validation" role="alert">{validation === 'realm' ? t.chooseRealm : t.enterName}</p>}</section>
+        <section className="search-panel panel" aria-label={t.search}><form onSubmit={search} noValidate><div className="search-region field"><label htmlFor="region">{t.region}</label><div className="select-wrap"><select id="region" value={region} onChange={event => { setRegion(event.target.value as Region); setRealm(null); setValidation(null); }}><option value="eu">Europe · EU</option><option value="us">Americas · US</option></select><Icon name="chevron" size={14}/></div></div><div className="search-realm field"><label htmlFor="realm">{t.realm}</label><RealmPicker key={realmPickerRevision} region={region} locale={locale} selected={realm} onChange={setRealm} t={t} invalid={validation === 'realm'}/></div><div className="search-name field"><label htmlFor="character-name">{t.name}</label><div className="input-icon"><Icon name="shield" size={17}/><input id="character-name" value={name} onChange={event => { setName(event.target.value); setValidation(null); }} autoComplete="off" placeholder={t.namePlaceholder} aria-invalid={validation === 'name'} aria-describedby={validation === 'name' ? 'search-validation' : undefined}/></div></div><button type="submit" className="button-primary search-button" disabled={character.busy || cooldown > 0}><Icon name={character.busy ? 'refresh' : 'search'} size={18} className={character.busy ? 'spinning' : ''}/><span>{character.busy ? t.searching : t.search}</span><Icon name="arrow" size={16}/></button></form>{validation && <p className="validation-message" id="search-validation" role="alert">{validation === 'realm' ? t.chooseRealm : t.enterName}</p>}</section>
 
         <div className="under-search"><span><Icon name="shield" size={13}/>{t.publicData}</span><span className="under-search-dot">·</span><span>{t.noAccount}</span><div className="provider-label"><span className={`status-dot ${runtime ? 'connected' : ''}`}/>{sourceLabel}</div></div>
         {demo && <div className="demo-banner"><div><span className="demo-pill">{t.demoLabel}</span><p>{t.demoText}</p></div><div className="demo-actions">{(runtime?.demo_characters ?? []).map(key => <button type="button" className="demo-button" disabled={character.busy} key={`${key.region}/${key.realm}/${key.name}`} onClick={() => open(key)}>{key.name}<span>{key.region.toUpperCase()}</span><Icon name="arrow" size={13}/></button>)}</div></div>}
