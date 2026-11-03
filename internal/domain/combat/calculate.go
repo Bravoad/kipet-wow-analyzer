@@ -77,9 +77,8 @@ func Calculate(c Collection, source string) (Analysis, error) {
 	out.CombatantStats = validateCombatantStats(c.CombatantStats, fight, c.ActorID)
 	events := append([]Event(nil), c.Events...)
 	sort.SliceStable(events, func(i, j int) bool { return events[i].TimestampMS < events[j].TimestampMS })
-	damage, healing, overheal := 0.0, 0.0, 0.0
+	var amounts eventAmounts
 	casts, interrupts, deaths := 0, 0, 0
-	damageKnown, healKnown, overhealKnown := true, true, true
 	amountsUnavailable := false
 	type observedAbility struct {
 		value                  Ability
@@ -128,23 +127,17 @@ func Calculate(c Collection, source string) (Analysis, error) {
 				abilities[*event.AbilityID] = ability
 			}
 		}
+		amountKnown := amounts.observe(event)
 		switch event.Kind {
 		case "damage":
-			if !add(&damage, event.Amount) {
-				damageKnown = false
-				if ability != nil {
-					ability.damageKnown = false
-				}
+			if ability != nil {
+				ability.damageKnown = ability.damageKnown && amountKnown
+				ability.value.Damage = sumPointer(ability.value.Damage, event.Amount, &ability.damageKnown)
 			}
 		case "heal":
-			if !add(&healing, event.Amount) {
-				healKnown = false
-				if ability != nil {
-					ability.healKnown = false
-				}
-			}
-			if !add(&overheal, event.Overheal) {
-				overhealKnown = false
+			if ability != nil {
+				ability.healKnown = ability.healKnown && amountKnown
+				ability.value.Healing = sumPointer(ability.value.Healing, event.Amount, &ability.healKnown)
 			}
 		case "cast":
 			casts++
@@ -154,36 +147,20 @@ func Calculate(c Collection, source string) (Analysis, error) {
 		case "interrupt":
 			interrupts++
 		}
-		if ability != nil && event.Kind == "damage" {
-			ability.value.Damage = sumPointer(ability.value.Damage, event.Amount, &ability.damageKnown)
-		}
-		if ability != nil && event.Kind == "heal" {
-			ability.value.Healing = sumPointer(ability.value.Healing, event.Amount, &ability.healKnown)
-		}
 	}
 	if fight.ParticipantIDs == nil && !actorObserved {
 		out.EventsComplete = false
 	}
 	if out.EventsComplete {
-		if damageKnown {
-			out.Metrics.DamageTotal = &damage
-			out.Metrics.DPS = rate(damage, out.DurationMS)
-		}
-		if healKnown {
-			out.Metrics.HealingTotal = &healing
-			out.Metrics.HPS = rate(healing, out.DurationMS)
-		}
-		if overhealKnown {
-			out.Metrics.OverhealTotal = &overheal
-		}
-		if healKnown && overhealKnown && healing+overheal > 0 && healing+overheal <= maxSafe {
-			value := 100 * overheal / (healing + overheal)
-			out.Metrics.OverhealPercent = &value
-		}
+		amountsUnavailable = amounts.publish(&out.Metrics, out.DurationMS)
 		out.Metrics.Casts = &casts
 		out.Metrics.Interrupts = &interrupts
 		out.Metrics.Deaths = &deaths
-		amountsUnavailable = !damageKnown || !healKnown || !overhealKnown || out.Metrics.DPS == nil || out.Metrics.HPS == nil
+	} else if c.ActorAmountEvents != nil && (fight.ParticipantIDs != nil || actorObserved || len(c.ActorAmountEvents) > 0) {
+		if scoped, ok := selectedActorAmounts(c.ActorAmountEvents, fight, c.ActorID); ok {
+			out.ActorAmountEventsComplete = true
+			amountsUnavailable = scoped.publish(&out.Metrics, out.DurationMS)
+		}
 	}
 	ids := make([]string, 0, len(abilities))
 	for id := range abilities {
@@ -220,6 +197,67 @@ func Calculate(c Collection, source string) (Analysis, error) {
 		out.Findings = append(out.Findings, Finding{Code: code, Outcome: "Unknown", EventIndexes: []int{}})
 	}
 	return out, nil
+}
+
+type observedAmount struct {
+	total   float64
+	missing bool
+}
+
+func (a *observedAmount) observe(value *float64) bool {
+	ok := add(&a.total, value)
+	a.missing = a.missing || !ok
+	return ok
+}
+
+type eventAmounts struct {
+	damage, healing, overheal observedAmount
+}
+
+func (a *eventAmounts) observe(event Event) bool {
+	switch event.Kind {
+	case "damage":
+		return a.damage.observe(event.Amount)
+	case "heal":
+		a.overheal.observe(event.Overheal)
+		return a.healing.observe(event.Amount)
+	default:
+		return true
+	}
+}
+
+func selectedActorAmounts(events []Event, fight Fight, actorID int) (eventAmounts, bool) {
+	var amounts eventAmounts
+	for _, event := range events {
+		if event.SourceID == nil || *event.SourceID != actorID ||
+			event.TimestampMS < fight.StartMS || event.TimestampMS > fight.EndMS ||
+			(event.Kind != "damage" && event.Kind != "heal") {
+			return eventAmounts{}, false
+		}
+		amounts.observe(event)
+	}
+	return amounts, true
+}
+
+// publish returns whether any amount or rate is unavailable.
+func (a eventAmounts) publish(metrics *Metrics, durationMS int64) bool {
+	if !a.damage.missing {
+		metrics.DamageTotal = &a.damage.total
+		metrics.DPS = rate(a.damage.total, durationMS)
+	}
+	if !a.healing.missing {
+		metrics.HealingTotal = &a.healing.total
+		metrics.HPS = rate(a.healing.total, durationMS)
+	}
+	if !a.overheal.missing {
+		metrics.OverhealTotal = &a.overheal.total
+	}
+	healingAndOverheal := a.healing.total + a.overheal.total
+	if !a.healing.missing && !a.overheal.missing && healingAndOverheal > 0 && healingAndOverheal <= maxSafe {
+		value := 100 * a.overheal.total / healingAndOverheal
+		metrics.OverhealPercent = &value
+	}
+	return metrics.DPS == nil || metrics.HPS == nil || metrics.OverhealTotal == nil
 }
 
 func validateCombatantStats(stats *CombatantStats, fight Fight, actorID int) *CombatantStats {

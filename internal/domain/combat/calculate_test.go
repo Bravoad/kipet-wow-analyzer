@@ -68,6 +68,73 @@ func TestIncompleteAndMissingAmountsNeverBecomeZero(t *testing.T) {
 		t.Fatal("explicit empty stream not preserved")
 	}
 }
+
+func TestCompleteActorAmountsWithPartialFightEvents(t *testing.T) {
+	c := sample()
+	c.Complete = false
+	damage := Event{TimestampMS: 1100, Kind: "damage", SourceID: pointer(1), AbilityID: pointer("11"), Amount: pointer(12000.0)}
+	c.Events = []Event{damage, {TimestampMS: 1600, Kind: "death", TargetID: pointer(1)}}
+	c.ActorAmountEvents = []Event{
+		damage,
+		{TimestampMS: 110000, Kind: "damage", SourceID: pointer(1), AbilityID: pointer("12"), Amount: pointer(12000.0)},
+		{TimestampMS: 111000, Kind: "heal", SourceID: pointer(1), TargetID: pointer(1), Amount: pointer(6000.0), Overheal: pointer(2000.0)},
+	}
+	a, err := Calculate(c, "warcraftlogs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Metrics{
+		DamageTotal: pointer(24000.0), DPS: pointer(200.0),
+		HealingTotal: pointer(6000.0), HPS: pointer(50.0), OverhealTotal: pointer(2000.0), OverhealPercent: pointer(25.0),
+	}
+	if a.EventsComplete || !a.ActorAmountEventsComplete || !reflect.DeepEqual(a.Metrics, want) {
+		t.Fatalf("unexpected completeness or metrics: %+v", a)
+	}
+	if !reflect.DeepEqual(a.Timeline, c.Events) || len(a.Abilities) != 1 || a.Abilities[0].ID != "11" ||
+		a.Findings[0].Code != "DEATHS_OBSERVED" || a.Findings[1].Code != "INCOMPLETE_EVENTS" {
+		t.Fatalf("actor amount stream changed sampled evidence: %+v", a)
+	}
+	c.ActorAmountEvents[2].Overheal = nil
+	a, err = Calculate(c, "warcraftlogs")
+	if err != nil || !a.ActorAmountEventsComplete || a.Metrics.HPS == nil || a.Metrics.OverhealTotal != nil ||
+		a.Metrics.OverhealPercent != nil || a.Findings[2].Code != "AMOUNTS_UNAVAILABLE" {
+		t.Fatalf("missing overheal hid effective healing or became zero: %+v, %v", a, err)
+	}
+}
+
+func TestActorAmountStreamNeedsValidBindingAndEvidence(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		memberList []int
+		events     []Event
+		complete   bool
+	}{
+		{name: "unavailable stream", memberList: []int{1}},
+		{name: "unknown empty participant", events: []Event{}},
+		{name: "confirmed empty participant", memberList: []int{1}, events: []Event{}, complete: true},
+		{name: "wrong source", memberList: []int{1}, events: []Event{{TimestampMS: 2000, Kind: "damage", SourceID: pointer(2), Amount: pointer(12.0)}}},
+		{name: "outside fight", memberList: []int{1}, events: []Event{{TimestampMS: 999, Kind: "damage", SourceID: pointer(1), Amount: pointer(12.0)}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := sample()
+			c.Complete = false
+			c.Report.Fights[0].ParticipantIDs = tt.memberList
+			c.ActorAmountEvents = tt.events
+			a, err := Calculate(c, "warcraftlogs")
+			if err != nil || a.ActorAmountEventsComplete != tt.complete {
+				t.Fatalf("unexpected scoped coverage %+v, %v", a, err)
+			}
+			if tt.complete {
+				if a.Metrics.DPS == nil || *a.Metrics.DPS != 0 {
+					t.Fatalf("confirmed empty stream lost its zero: %+v", a.Metrics)
+				}
+			} else if !reflect.DeepEqual(a.Metrics, Metrics{}) {
+				t.Fatalf("unconfirmed scope published metrics: %+v", a.Metrics)
+			}
+		})
+	}
+}
+
 func TestRateOverflowAndUnknownEventsFailClosed(t *testing.T) {
 	c := sample()
 	c.Report.Fights[0].EndMS = 1001

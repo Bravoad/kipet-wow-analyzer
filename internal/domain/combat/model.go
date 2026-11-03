@@ -45,14 +45,16 @@ type CombatantStats struct {
 	Values       map[string]float64 `json:"values"`
 }
 
-// Collection completeness concerns the whole requested fight window. A capped
-// or invalid event stream must never yield apparently complete DPS/HPS.
+// Complete describes the fight-wide event stream. ActorAmountEvents is set
+// only for an independently completed stream of the selected actor's outgoing
+// damage and healing. A nil slice conveys that coverage was not established.
 type Collection struct {
-	Report           Report
-	FightID, ActorID int
-	Events           []Event
-	Complete         bool
-	CombatantStats   *CombatantStats
+	Report            Report
+	FightID, ActorID  int
+	Events            []Event
+	Complete          bool
+	ActorAmountEvents []Event
+	CombatantStats    *CombatantStats
 }
 type Metrics struct {
 	DamageTotal     *float64 `json:"damage_total"`
@@ -77,19 +79,20 @@ type Finding struct {
 	EventIndexes []int  `json:"event_indexes"`
 }
 type Analysis struct {
-	ReportCode        string          `json:"report_code"`
-	FightID           int             `json:"fight_id"`
-	ActorID           int             `json:"actor_id"`
-	FightStartMS      int64           `json:"fight_start_ms"`
-	FightEndMS        int64           `json:"fight_end_ms"`
-	DurationMS        int64           `json:"duration_ms"`
-	Method            string          `json:"method"`
-	Source            string          `json:"source"`
-	EventsComplete    bool            `json:"events_complete"`
-	TimelineTruncated bool            `json:"timeline_truncated"`
-	Metrics           Metrics         `json:"metrics"`
-	CombatantStats    *CombatantStats `json:"combatant_stats,omitempty"`
-	Abilities         []Ability       `json:"abilities"`
-	Timeline          []Event         `json:"timeline"`
-	Findings          []Finding       `json:"findings"`
+	ReportCode                string          `json:"report_code"`
+	FightID                   int             `json:"fight_id"`
+	ActorID                   int             `json:"actor_id"`
+	FightStartMS              int64           `json:"fight_start_ms"`
+	FightEndMS                int64           `json:"fight_end_ms"`
+	DurationMS                int64           `json:"duration_ms"`
+	Method                    string          `json:"method"`
+	Source                    string          `json:"source"`
+	EventsComplete            bool            `json:"events_complete"`
+	ActorAmountEventsComplete bool            `json:"actor_amount_events_complete,omitempty"`
+	TimelineTruncated         bool            `json:"timeline_truncated"`
+	Metrics                   Metrics         `json:"metrics"`
+	CombatantStats            *CombatantStats `json:"combatant_stats,omitempty"`
+	Abilities                 []Ability       `json:"abilities"`
+	Timeline                  []Event         `json:"timeline"`
+	Findings                  []Finding       `json:"findings"`
 }

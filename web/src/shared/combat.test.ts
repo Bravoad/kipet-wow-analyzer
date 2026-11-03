@@ -40,6 +40,14 @@ test('death observations and unavailable rules have distinct explanations in bot
     assert.equal(findingText('INCOMPLETE_EVENTS',t),t.incompleteFinding);
   }
 });
+test('incomplete fight findings distinguish known actor amounts from unknown counts', () => {
+  for (const locale of ['ru-RU','en-US'] as const) {
+    const t = combatMessages(locale);
+    assert.equal(findingText('INCOMPLETE_EVENTS', t, true), t.incompleteCountsFinding);
+    assert.notEqual(findingText('INCOMPLETE_EVENTS', t), t.incompleteCountsFinding);
+    assert.equal(findingText('AMOUNTS_UNAVAILABLE', t, true), t.amountsFinding);
+  }
+});
 test('fight membership distinguishes explicit empty, known members, and unknown while excluding pets', () => {
   const actors = [{id:1,type:'player'}, {id:2,type:'player'}, {id:3,type:'pet'}, {id:4,type:'npc'}] as CombatActor[];
   assert.deepEqual(fightPlayers(actors,{participant_ids:[2,3]} as CombatFight).map(actor => actor.id),[2]);

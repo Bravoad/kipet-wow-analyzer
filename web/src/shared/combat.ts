@@ -12,7 +12,7 @@ export type CombatantStatKey = 'strength' | 'agility' | 'intellect' | 'stamina'
   | 'haste' | 'haste_melee' | 'haste_ranged' | 'haste_spell' | 'mastery'
   | 'versatility' | 'versatility_damage_done' | 'versatility_healing_done' | 'versatility_damage_reduction';
 export interface CombatantStats { observed_at_ms: number; values: Partial<Record<CombatantStatKey, number>> }
-export interface CombatAnalysis { report_code: string; fight_id: number; actor_id: number; fight_start_ms: number; fight_end_ms: number; duration_ms: number; method: string; source: string; events_complete: boolean; timeline_truncated: boolean; metrics: CombatMetrics; abilities: CombatAbility[] | null; timeline: CombatEvent[] | null; findings: CombatFinding[] | null; combatant_stats?: CombatantStats | null }
+export interface CombatAnalysis { report_code: string; fight_id: number; actor_id: number; fight_start_ms: number; fight_end_ms: number; duration_ms: number; method: string; source: string; events_complete: boolean; actor_amount_events_complete?: true; timeline_truncated: boolean; metrics: CombatMetrics; abilities: CombatAbility[] | null; timeline: CombatEvent[] | null; findings: CombatFinding[] | null; combatant_stats?: CombatantStats | null }
 
 export function reportCode(input: string): string | null {
   const text = input.trim();

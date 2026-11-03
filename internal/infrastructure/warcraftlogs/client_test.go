@@ -325,13 +325,17 @@ func TestEventPageAllowsBoundedTimestampOverflow(t *testing.T) {
 	}
 }
 func TestPaginationLimitsAndPrivacyChangesNeverProduceCompleteMetrics(t *testing.T) {
-	for _, mode := range []string{"cap", "loop", "missing", "invalid", "private"} {
-		pages := 0
+	for _, mode := range []string{"cap", "unordered", "loop", "missing", "invalid", "private"} {
+		pages, amountPages := 0, 0
 		c := testClient(t, func(r *http.Request) (*http.Response, error) {
 			if r.URL.Path == "/oauth/token" {
 				return tokenResponse(), nil
 			}
 			query, variables := requestPayload(t, r)
+			if strings.Contains(query, "PublicActorAmountEvents") {
+				amountPages++
+				return reportResponse(`{"code":"DEMOCombat000001","visibility":"public","events":{"data":[]}}`), nil
+			}
 			if !strings.Contains(query, "PublicFightEvents") {
 				return reportResponse(syntheticReport), nil
 			}
@@ -339,6 +343,8 @@ func TestPaginationLimitsAndPrivacyChangesNeverProduceCompleteMetrics(t *testing
 			start := *integer(variables["start"])
 			paginator := map[string]any{"data": []any{map[string]any{"timestamp": start + 10, "type": "damage", "sourceID": 1, "amount": 10}}, "nextPageTimestamp": start + 100}
 			switch mode {
+			case "unordered":
+				paginator["data"] = append(paginator["data"].([]any), map[string]any{"timestamp": start + 5, "type": "cast", "sourceID": 1})
 			case "loop":
 				paginator["nextPageTimestamp"] = start
 			case "missing":
@@ -369,10 +375,164 @@ func TestPaginationLimitsAndPrivacyChangesNeverProduceCompleteMetrics(t *testing
 		if err != nil || collected.Complete || pages > 5 || mode == "cap" && pages != 5 {
 			t.Fatalf("unsafe pagination %s %+v %v", mode, collected, err)
 		}
+		if (mode == "cap" && amountPages != 1) || (mode != "cap" && amountPages != 0) || collected.ActorAmountEvents != nil {
+			t.Fatalf("unsafe actor amount fallback for %s: %d pages", mode, amountPages)
+		}
 		a, _ := combat.Calculate(collected, "warcraftlogs")
 		if a.Metrics.DPS != nil {
 			t.Fatal("partial stream yielded DPS")
 		}
+	}
+}
+
+func TestCappedFightUsesOnlyCompleteExactActorAmounts(t *testing.T) {
+	for _, lastVisibility := range []string{"public", "private"} {
+		t.Run(lastVisibility, func(t *testing.T) {
+			fightPages, actorPages := 0, 0
+			c := testClient(t, func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/oauth/token" {
+					return tokenResponse(), nil
+				}
+				query, variables := requestPayload(t, r)
+				switch {
+				case strings.Contains(query, "PublicFightEvents"):
+					fightPages++
+					start := *integer(variables["start"])
+					wide := object{
+						"code": "DEMOCombat000001", "visibility": "public",
+						"events": object{"data": []object{{"timestamp": start, "type": "future_event", "sourceID": 2}}, "nextPageTimestamp": start + 100},
+					}
+					body, err := json.Marshal(wide)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return reportResponse(string(body)), nil
+				case strings.Contains(query, "PublicActorAmountEvents"):
+					actorPages++
+					start := 0
+					if actorPages > 1 {
+						start = 200
+					}
+					if !strings.Contains(query, "dataType: All") || !strings.Contains(query, "sourceID: $actor") ||
+						!strings.Contains(query, "useActorIDs: true") ||
+						*localID(variables["actor"]) != 1 || *localID(variables["fight"]) != 1 ||
+						*integer(variables["start"]) != int64(start) || *integer(variables["end"]) != 120000 {
+						t.Fatal("actor amount query lost fight, cursor or actor scope")
+					}
+					if actorPages == 1 {
+						return reportResponse(`{"code":"DEMOCombat000001","visibility":"public","events":{"data":[
+							{"timestamp":0,"type":"damage","sourceID":1,"amount":12000},
+							{"timestamp":0,"type":"damage","sourceID":2,"amount":800},
+							{"timestamp":100,"type":"cast","sourceID":1}
+						],"nextPageTimestamp":200}}`), nil
+					}
+					return reportResponse(`{"code":"DEMOCombat000001","visibility":"` + lastVisibility + `","events":{"data":[
+						{"timestamp":200,"type":"heal","sourceID":1,"targetID":1,"amount":-1,"overheal":0}
+					],"nextPageTimestamp":null}}`), nil
+				default:
+					return reportResponse(syntheticReport), nil
+				}
+			})
+			report, err := c.Report(context.Background(), "DEMOCombat000001")
+			if err != nil {
+				t.Fatal(err)
+			}
+			collected, err := c.Collect(context.Background(), report, 1, 1)
+			if fightPages != maxEventPages || actorPages != 2 {
+				t.Fatalf("unexpected page counts: %d fight, %d actor", fightPages, actorPages)
+			}
+			if lastVisibility == "private" {
+				if character.AsFault(err).Code != "REPORT_UNAVAILABLE" || len(collected.Events) != 0 || collected.ActorAmountEvents != nil {
+					t.Fatalf("fallback published data after a privacy change: %+v %v", collected, err)
+				}
+				return
+			}
+			if err != nil || collected.Complete || len(collected.Events) != maxEventPages || len(collected.ActorAmountEvents) != 2 {
+				t.Fatalf("unexpected capped fight: %+v %v", collected, err)
+			}
+			damage, heal := collected.ActorAmountEvents[0], collected.ActorAmountEvents[1]
+			if damage.Kind != "damage" || damage.Amount == nil || *damage.Amount != 12000 ||
+				heal.Kind != "heal" || heal.Amount != nil || heal.Overheal == nil || *heal.Overheal != 0 {
+				t.Fatalf("amount events lost exact attribution or unknown/zero values: %+v", collected.ActorAmountEvents)
+			}
+		})
+	}
+}
+
+func TestTimestampGroupAtFightCapRequiresValidPage(t *testing.T) {
+	for _, cursorPresent := range []bool{true, false} {
+		fightPages, actorPages := 0, 0
+		c := testClient(t, func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path == "/oauth/token" {
+				return tokenResponse(), nil
+			}
+			query, variables := requestPayload(t, r)
+			if strings.Contains(query, "PublicActorAmountEvents") {
+				actorPages++
+				return reportResponse(`{"code":"DEMOCombat000001","visibility":"public","events":{"data":[],"nextPageTimestamp":null}}`), nil
+			}
+			fightPages++
+			start := *integer(variables["start"])
+			count := eventPageSize
+			if fightPages == maxEventPages {
+				count += 2 // Two more events share the timestamp at the cap.
+			}
+			rows := make([]object, count)
+			for i := range rows {
+				rows[i] = object{"type": "cast", "sourceID": 1, "timestamp": start}
+			}
+			page := object{"data": rows, "nextPageTimestamp": start + 100}
+			if fightPages == maxEventPages {
+				if cursorPresent {
+					page["nextPageTimestamp"] = nil
+				} else {
+					delete(page, "nextPageTimestamp")
+				}
+			}
+			body, err := json.Marshal(object{"code": "DEMOCombat000001", "visibility": "public", "events": page})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return reportResponse(string(body)), nil
+		})
+		report := combat.Report{Code: "DEMOCombat000001", Visibility: "public",
+			Fights: []combat.Fight{{ID: 1, StartMS: 0, EndMS: 10000}},
+			Actors: []combat.Actor{{ID: 1, Type: "player"}},
+		}
+		out, err := c.Collect(context.Background(), report, 1, 1)
+		if err != nil || out.Complete || len(out.Events) != maxFightEvents ||
+			(cursorPresent && (actorPages != 1 || out.ActorAmountEvents == nil)) ||
+			(!cursorPresent && (actorPages != 0 || out.ActorAmountEvents != nil)) {
+			t.Fatalf("cursor present = %t: invalid cap behavior (%d wide rows, %d actor pages, error %v)", cursorPresent, len(out.Events), actorPages, err)
+		}
+	}
+}
+
+func TestActorAmountsRequireAValidCompletedWindow(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		paginator string
+	}{
+		{"missing cursor", `{"data":[]}`},
+		{"cursor exceeds window", `{"data":[],"nextPageTimestamp":10001}`},
+		{"cursor overlaps last timestamp", `{"data":[{"type":"cast","timestamp":500}],"nextPageTimestamp":500}`},
+		{"malformed damage identity", `{"data":[{"type":"damage","timestamp":500,"amount":25}],"nextPageTimestamp":null}`},
+		{"different fight", `{"data":[{"type":"damage","timestamp":500,"sourceID":1,"fight":2,"amount":25}],"nextPageTimestamp":null}`},
+		{"decreasing timestamps", `{"data":[{"type":"cast","timestamp":501},{"type":"cast","timestamp":500}],"nextPageTimestamp":null}`},
+		{"missing timestamp", `{"data":[{"type":"cast"}],"nextPageTimestamp":null}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := testClient(t, func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/oauth/token" {
+					return tokenResponse(), nil
+				}
+				return reportResponse(`{"code":"DEMOCombat000001","visibility":"public","events":` + tt.paginator + `}`), nil
+			})
+			events, err := c.collectActorAmounts(context.Background(), "DEMOCombat000001", combat.Fight{ID: 1, StartMS: 0, EndMS: 10000}, 1)
+			if err != nil || events != nil {
+				t.Fatalf("unverified window returned actor events: %+v %v", events, err)
+			}
+		})
 	}
 }
 func TestRedirectsOversizedBodiesAndUnexpectedHostsAreRejected(t *testing.T) {
