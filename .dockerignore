@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+!.env.example
+web/node_modules
+tests/contract/node_modules
+web/dist
+bin
+artifacts
+*.exe

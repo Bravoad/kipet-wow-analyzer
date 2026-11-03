@@ -1,0 +1,124 @@
+name: Application checks
+on: [push, pull_request]
+permissions:
+  contents: read
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: kipet
+          POSTGRES_PASSWORD: kipet
+          POSTGRES_DB: kipet
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U kipet -d kipet" --health-interval 3s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:8-alpine
+        ports: ['6379:6379']
+    env:
+      TEST_DATABASE_URL: postgres://kipet:kipet@localhost:5432/kipet?sslmode=disable
+      DATABASE_URL: postgres://kipet:kipet@localhost:5432/kipet?sslmode=disable
+      REDIS_URL: redis://localhost:6379/0
+      PROVIDER_MODE: fixture
+      APP_HMAC_SECRET: ci-synthetic-only-do-not-use-in-production
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27'
+          cache: true
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            tests/contract/package-lock.json
+      - name: Verify Go formatting and module integrity
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+          go mod verify
+      - run: go vet ./...
+      - run: go test -race ./... -count=1
+      - name: Check reachable Go vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          govulncheck ./...
+      - name: Install, audit and verify frontend
+        run: |
+          npm ci --prefix web
+          npm audit --prefix web --audit-level=low
+          npm run build --prefix web
+          npm test --prefix web
+      - name: Install and audit contract tooling
+        run: |
+          npm ci --prefix tests/contract
+          npm audit --prefix tests/contract --audit-level=low
+      - name: Run API and worker against synthetic provider
+        run: |
+          go run ./cmd/migrate
+          mkdir -p bin
+          go build -o bin/api ./cmd/api
+          go build -o bin/worker ./cmd/worker
+          ./bin/api > /tmp/kipet-api.log 2>&1 &
+          echo "API_PID=$!" >> "$GITHUB_ENV"
+          ./bin/worker > /tmp/kipet-worker.log 2>&1 &
+          echo "WORKER_PID=$!" >> "$GITHUB_ENV"
+          ready=false
+          for attempt in $(seq 1 60); do
+            if curl --max-time 2 -fsS 'http://127.0.0.1:9091/health/ready' > /dev/null &&
+               curl --max-time 2 -fsS 'http://127.0.0.1:9092/health/ready' > /dev/null &&
+               curl --max-time 2 -fsS 'http://127.0.0.1:8080/api/v1/meta/realms?region=eu' | node -e 'const fs=require("fs"); process.exit(JSON.parse(fs.readFileSync(0,"utf8")).data?.items?.length ? 0 : 1)'; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+      - name: Verify live fixture HTTP contracts
+        run: npm test --prefix tests/contract
+      - name: Build deployment images
+        run: docker compose build api web
+      - name: Start the real nginx gateway against the native test API
+        run: |
+          docker run -d --network host --add-host api:127.0.0.1 --name kipet-ci-web kipet-wow-analyzer-web
+          ready=false
+          for attempt in $(seq 1 30); do
+            if curl --max-time 2 -fsS 'http://127.0.0.1/' > /dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+      - name: Verify API and gateway security regressions
+        env:
+          API_BASE_URL: http://127.0.0.1
+          API_DIRECT_BASE_URL: http://127.0.0.1:8080
+        run: node tests/security/http-smoke.mjs
+      - name: Stop local test processes
+        if: always()
+        run: |
+          if docker container inspect kipet-ci-web > /dev/null 2>&1; then
+            docker rm -f kipet-ci-web
+          fi
+          for pid in "${API_PID:-}" "${WORKER_PID:-}"; do
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+              kill -TERM "$pid"
+            fi
+          done

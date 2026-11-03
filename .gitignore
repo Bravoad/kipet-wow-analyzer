@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+web/node_modules/
+tests/contract/node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/
+bin/
+*.exe
+coverage.out
+.DS_Store
+artifacts/

@@ -1,0 +1,43 @@
+services:
+  prometheus:
+    image: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+    command: [--config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.retention.time=24h, --storage.tsdb.retention.size=256MB]
+    ports: ["127.0.0.1:9090:9090"]
+    volumes:
+      - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    logging: {driver: local, options: {max-size: '10m', max-file: '3'}}
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+  grafana:
+    image: grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
+    environment:
+      GF_SECURITY_ADMIN_USER: kipet-admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set a unique GRAFANA_ADMIN_PASSWORD using an ignored local env file}
+      GF_SECURITY_SECRET_KEY: ${GRAFANA_SECRET_KEY:?Set a unique GRAFANA_SECRET_KEY in the same ignored env file}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_AUTH_ANONYMOUS_ENABLED: 'false'
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+      GF_ANALYTICS_CHECK_FOR_UPDATES: 'false'
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: 'false'
+      GF_PLUGINS_PREINSTALL_DISABLED: 'true'
+      GF_PLUGINS_PREINSTALL_AUTO_UPDATE: 'false'
+    ports: ["127.0.0.1:3000:3000"]
+    volumes:
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    cap_drop: [ALL]
+    logging: {driver: local, options: {max-size: '10m', max-file: '3'}}
+    security_opt: [no-new-privileges:true]
+    depends_on: [prometheus]
+volumes:
+  prometheus-data:
+  grafana-data:

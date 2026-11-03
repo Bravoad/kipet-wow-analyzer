@@ -1,0 +1,133 @@
+name: kipet-wow-analyzer
+x-logging: &default-logging
+  driver: local
+  options:
+    max-size: '10m'
+    max-file: '3'
+x-backend: &backend
+  image: kipet-wow-backend:local
+  logging: *default-logging
+  build:
+    context: .
+    dockerfile: deploy/docker/backend.Dockerfile
+    args:
+      GO_IMAGE: ${GO_IMAGE:-golang:1.27-alpine}
+      ALPINE_IMAGE: ${ALPINE_IMAGE:-alpine:3.23}
+  environment: &backend-env
+    DATABASE_URL: postgres://kipet:kipet@postgres:5432/kipet?sslmode=disable
+    REDIS_URL: redis://redis:6379/0
+    PROVIDER_MODE: ${PROVIDER_MODE:-fixture}
+    BLIZZARD_CLIENT_ID: ${BLIZZARD_CLIENT_ID:-}
+    BLIZZARD_CLIENT_SECRET: ${BLIZZARD_CLIENT_SECRET:-}
+    COMBAT_PROVIDER_MODE: ${COMBAT_PROVIDER_MODE:-}
+    COMBAT_DATABASE_URL: ${COMBAT_DATABASE_URL:-}
+    WCL_CLIENT_ID: ${WCL_CLIENT_ID:-}
+    WCL_CLIENT_SECRET: ${WCL_CLIENT_SECRET:-}
+    RAIDERIO_ENABLED: ${RAIDERIO_ENABLED:-false}
+    APP_HMAC_SECRET: ${APP_HMAC_SECRET:-local-development-only-replace-this-before-real-use}
+    API_ADDR: :8080
+    INTERNAL_ADDR: :9091
+    WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+    API_REPLICAS: ${API_REPLICAS:-1}
+services:
+  postgres:
+    image: postgres:18-alpine
+    command: [postgres, -c, log_statement=none, -c, log_min_error_statement=panic, -c, log_parameter_max_length_on_error=0, -c, log_error_verbosity=terse]
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: kipet
+      POSTGRES_PASSWORD: kipet
+      POSTGRES_DB: kipet
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U kipet -d kipet"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:8-alpine
+    logging: *default-logging
+    command: [redis-server, --save, "", --appendonly, "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  migrate:
+    <<: *backend
+    entrypoint: [/app/migrate]
+    depends_on:
+      postgres:
+        condition: service_healthy
+  api:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      TRUSTED_PROXY_CIDRS: 172.29.231.10/32
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, wget, -qO-, http://127.0.0.1:9091/health/ready]
+      interval: 10s
+      timeout: 4s
+      start_period: 10s
+      retries: 3
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      default:
+        ipv4_address: 172.29.231.11
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+  worker:
+    <<: *backend
+    entrypoint: [/app/worker]
+    environment:
+      <<: *backend-env
+      WORKER_INTERNAL_ADDR: :9092
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, wget, -qO-, http://127.0.0.1:9092/health/ready]
+      interval: 10s
+      timeout: 4s
+      start_period: 10s
+      retries: 3
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+  web:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: deploy/docker/web.Dockerfile
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:24-alpine}
+        NGINX_IMAGE: ${NGINX_IMAGE:-nginx:stable-alpine}
+    ports:
+      - "127.0.0.1:5173:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      default:
+        ipv4_address: 172.29.231.10
+volumes:
+  postgres-data:
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.29.231.0/24

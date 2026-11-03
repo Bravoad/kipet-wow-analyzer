@@ -1,0 +1,2228 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: Kipet WoW Analyzer — MVP API
+  version: 0.9.0
+  description: >-
+    Контракт локальной реализации этапов 1–5 и эксплуатационных дополнений этапа 6, 1 ноября 2026. Live-схемы Blizzard и Warcraft Logs требуют проверки с credentials.
+    Публичный доступ без регистрации. Только EU/US, только общедоступные профили Blizzard.
+    Пользовательские HTTP-запросы не вызывают Blizzard напрямую; загрузка выполняется worker.
+    Все времена UTC RFC 3339. Все provider ID передаются десятичными строками.
+servers:
+  - url: /
+    description: Текущий origin; внешний адрес будет выбран при развёртывании
+security: []
+tags:
+  - name: Guilds
+    description: Состав гильдии и сводка с явным охватом
+  - name: Comparisons
+    description: До пяти разрешённых снимков без общего рейтинга
+  - name: Reports
+    description: Публичные боевые отчёты и расчёты с явной методикой
+  - name: Characters
+    description: Профиль и нормализованные секции персонажа
+  - name: Metadata
+    description: Справочник игровых серверов
+  - name: Jobs
+    description: Ограниченное публичное представление фоновых заданий
+  - name: Internal
+    description: Только внутренняя сеть; внешний ingress обязан закрыть маршруты
+paths:
+  /api/v1/runtime:
+    get:
+      tags: [Metadata]
+      operationId: getRuntime
+      summary: Узнать явный режим источника и доступные синтетические примеры
+      description: Не содержит конфигурацию, секреты и провайдерские токены. Служебный ответ без envelope игровых данных.
+      responses:
+        '200':
+          description: Безопасные сведения о режиме приложения
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [provider_mode, demo_characters, combat_mode, demo_reports, demo_guilds, demo_comparisons, raiderio_enabled, combat_setup_required]
+                properties:
+                  provider_mode: { type: string, enum: [fixture, blizzard] }
+                  combat_mode: { type: string, enum: [fixture, warcraftlogs, disabled] }
+                  raiderio_enabled: { type: boolean }
+                  combat_setup_required: { type: boolean }
+                  demo_reports: { type: array, items: { $ref: '#/components/schemas/ReportCode' } }
+                  demo_guilds:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [region, realm, name]
+                      properties:
+                        region: { $ref: '#/components/schemas/Region' }
+                        realm: { type: string }
+                        name: { type: string }
+                  demo_comparisons:
+                    type: array
+                    items: { type: array, minItems: 1, maxItems: 5, items: { $ref: '#/components/schemas/CharacterInput' } }
+                  demo_characters:
+                    type: array
+                    maxItems: 10
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [region, realm, name]
+                      properties:
+                        region: { $ref: '#/components/schemas/Region' }
+                        realm: { type: string }
+                        name: { type: string }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/characters/{region}/{realm}/{name}/analysis:
+    parameters:
+      - $ref: '#/components/parameters/RegionPath'
+      - $ref: '#/components/parameters/RealmPath'
+      - $ref: '#/components/parameters/NamePath'
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Characters]
+      operationId: getCharacterAnalysis
+      summary: Объяснимые проверки текущего снимка по точному контексту
+      description: >-
+        Анализатор использует только разрешённые к показу данные. При отсутствии проверенного
+        набора правил возвращается 200 с Unknown и объяснением; это не ошибка игрока.
+        Синтетические правила исполняются исключительно для fixture. Загрузка отсутствующего
+        обязательного профиля даёт 202. Кеш привязан к snapshot, контексту и версии движка;
+        результат не содержит универсального балла качества или утверждений о DPS/BiS.
+      parameters:
+        - name: content
+          in: query
+          schema: { type: string, enum: [general_pve, raid, mythic_plus], default: general_pve }
+      responses:
+        '200':
+          description: Результаты, доказательства, provenance и диагностика полноты
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnalysisResponse' }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/characters/{region}/{realm}/{name}:
+    parameters:
+      - $ref: '#/components/parameters/RegionPath'
+      - $ref: '#/components/parameters/RealmPath'
+      - $ref: '#/components/parameters/NamePath'
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Characters]
+      operationId: getCharacter
+      summary: Получить профиль персонажа
+      description: >-
+        200 — допустимый профиль; stale-while-revalidate явно отражён в meta.
+        202 — пригодного профиля пока нет и задание принято.
+        404 — подтверждённая недоступность профиля либо неизвестный сервер.
+        502 — в том числе неоднозначный отказ доступа провайдера; старые данные скрыты.
+      responses:
+        '200':
+          description: Профиль с метаданными фактической загрузки; встроенный пример синтетический, не fixture Blizzard
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CharacterResponse' }
+              example:
+                data:
+                  id: 00000000-0000-4000-8000-000000000011
+                  provider_id: '1'
+                  region: eu
+                  realm:
+                    id: '1'
+                    region: eu
+                    slug: example-realm
+                    name: Синтетический сервер
+                    connected_realm_id: null
+                  name: Пример
+                  name_normalized: пример
+                  level: 1
+                  race: { id: '1', name: null }
+                  character_class: { id: '1', name: null }
+                  active_specialization: null
+                  faction: unknown
+                  average_item_level: null
+                  equipped_item_level: null
+                  source_last_login_at: null
+                meta:
+                  source: blizzard
+                  fetched_at: '2026-10-30T09:00:00Z'
+                  status: fresh
+                  snapshot_id: 00000000-0000-4000-8000-000000000012
+                  valid_until: '2026-11-29T09:00:00Z'
+                  patch: null
+                  season: null
+                  locale: ru-RU
+                  coverage:
+                    profile:
+                      state: complete
+                      fetched_at: '2026-10-30T09:00:00Z'
+                      fresh_until: '2026-10-30T09:15:00Z'
+                      valid_until: '2026-11-29T09:00:00Z'
+                      reason: null
+                  job_id: null
+                request_id: 00000000-0000-4000-8000-000000000001
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/characters/{region}/{realm}/{name}/equipment:
+    parameters:
+      - $ref: '#/components/parameters/RegionPath'
+      - $ref: '#/components/parameters/RealmPath'
+      - $ref: '#/components/parameters/NamePath'
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Characters]
+      operationId: getCharacterEquipment
+      summary: Получить экипировку
+      description: >-
+        При пригодном основном профиле неполученная секция возвращается как 200 data:null
+        и coverage.equipment.state=unavailable; это не означает пустую экипировку.
+      responses:
+        '200':
+          description: Секция экипировки либо явно обозначенное отсутствие данных секции
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EquipmentResponse' }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/characters/{region}/{realm}/{name}/statistics:
+    parameters:
+      - $ref: '#/components/parameters/RegionPath'
+      - $ref: '#/components/parameters/RealmPath'
+      - $ref: '#/components/parameters/NamePath'
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Characters]
+      operationId: getCharacterStatistics
+      summary: Получить характеристики персонажа
+      responses:
+        '200':
+          description: Характеристики либо data:null при недоступной секции и пригодном профиле
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatisticsResponse' }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/characters/{region}/{realm}/{name}/talents:
+    parameters:
+      - $ref: '#/components/parameters/RegionPath'
+      - $ref: '#/components/parameters/RealmPath'
+      - $ref: '#/components/parameters/NamePath'
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Characters]
+      operationId: getCharacterTalents
+      summary: Получить выбранные таланты без оценки билда
+      description: Эталонные билды и рекомендации относятся к этапу 2.
+      responses:
+        '200':
+          description: Доступные наборы талантов либо data:null; встроенный пример синтетический, не fixture Blizzard
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TalentsResponse' }
+              example:
+                data:
+                  character_id: 00000000-0000-4000-8000-000000000011
+                  loadouts:
+                    - provider_id: null
+                      specialization: { id: '1', name: null }
+                      is_active: null
+                      export_code: null
+                      tree_hash: null
+                      nodes: null
+                meta:
+                  source: blizzard
+                  fetched_at: '2026-10-30T09:00:00Z'
+                  status: fresh
+                  snapshot_id: 00000000-0000-4000-8000-000000000012
+                  valid_until: '2026-11-29T09:00:00Z'
+                  patch: null
+                  season: null
+                  locale: ru-RU
+                  coverage:
+                    profile:
+                      state: complete
+                      fetched_at: '2026-10-30T09:00:00Z'
+                      fresh_until: '2026-10-30T09:15:00Z'
+                      valid_until: '2026-11-29T09:00:00Z'
+                      reason: null
+                    talents:
+                      state: partial
+                      fetched_at: '2026-10-30T09:00:00Z'
+                      fresh_until: '2026-10-30T09:30:00Z'
+                      valid_until: '2026-11-29T09:00:00Z'
+                      reason: not_provided
+                  job_id: null
+                request_id: 00000000-0000-4000-8000-000000000001
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/characters/{region}/{realm}/{name}/mythic-plus:
+    parameters:
+      - $ref: '#/components/parameters/RegionPath'
+      - $ref: '#/components/parameters/RealmPath'
+      - $ref: '#/components/parameters/NamePath'
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Characters]
+      operationId: getCharacterMythicPlus
+      summary: Лучшие наблюдаемые прохождения Mythic+
+      description: >-
+        Сезон подтверждается источником; run_scope различает season_best, current_period_best и unknown. Это не полная история ключей и не содержимое Great Vault.
+        При пригодном профиле недоступная секция возвращается как 200 data:null с coverage unavailable.
+      responses:
+        '200':
+          description: Нормализованные наблюдения либо явно обозначенная недоступность
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MythicPlusResponse' }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/characters/{region}/{realm}/{name}/raids:
+    parameters:
+      - $ref: '#/components/parameters/RegionPath'
+      - $ref: '#/components/parameters/RealmPath'
+      - $ref: '#/components/parameters/NamePath'
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Characters]
+      operationId: getCharacterRaids
+      summary: Наблюдаемый прогресс рейдов и боссов
+      description: >-
+        Иерархия expansion/instance/difficulty отражает источник, включая исторические рейды. Отсутствующий счётчик не означает ноль убийств.
+        При пригодном профиле недоступная секция возвращается как 200 data:null с coverage unavailable.
+      responses:
+        '200':
+          description: Нормализованные наблюдения либо явно обозначенная недоступность
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RaidsResponse' }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/reports/{code}:
+    parameters:
+      - name: code
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ReportCode' }
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Reports]
+      operationId: getPublicReport
+      summary: Метаданные публичного боевого отчёта
+      description: >-
+        HTTP не обращается к Warcraft Logs. Допускаются только явно публичные отчёты.
+        Загрузка выполняется отдельным worker; 202 означает принятое задание.
+        Кеш не переживает проверку доступности отчёта. fixture явно синтетический.
+      responses:
+        '200':
+          description: Наблюдаемые данные с версией отчёта и метаданными
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicReportResponse' }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/reports/{code}/fights:
+    parameters:
+      - name: code
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ReportCode' }
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Reports]
+      operationId: getReportFights
+      summary: Бои и участники публичного отчёта
+      description: >-
+        HTTP не обращается к Warcraft Logs. Допускаются только явно публичные отчёты.
+        Загрузка выполняется отдельным worker; 202 означает принятое задание.
+        Кеш не переживает проверку доступности отчёта. fixture явно синтетический.
+      responses:
+        '200':
+          description: Наблюдаемые данные с версией отчёта и метаданными
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportFightsResponse' }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/reports/{code}/fights/{fightID}/analysis:
+    parameters:
+      - name: code
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ReportCode' }
+      - $ref: '#/components/parameters/Locale'
+      - name: fightID
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/CombatID' }
+      - name: actor_id
+        in: query
+        required: true
+        schema: { $ref: '#/components/schemas/CombatID' }
+    get:
+      tags: [Reports]
+      operationId: getCombatAnalysis
+      summary: Расчёт по событиям выбранного участника боя
+      description: >-
+        HTTP не обращается к Warcraft Logs. Допускаются только явно публичные отчёты.
+        Загрузка выполняется отдельным worker; 202 означает принятое задание.
+        Кеш не переживает проверку доступности отчёта. fixture явно синтетический.
+      responses:
+        '200':
+          description: Наблюдаемые данные с версией отчёта и метаданными
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CombatAnalysisResponse' }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/guilds/{region}/{realm}/{name}:
+    parameters:
+      - $ref: '#/components/parameters/RegionPath'
+      - $ref: '#/components/parameters/RealmPath'
+      - name: name
+        in: path
+        required: true
+        description: Канонический slug гильдии, без транслитерации отображаемого имени
+        schema: { type: string, minLength: 2, maxLength: 100 }
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Guilds]
+      operationId: getGuild
+      summary: Профиль гильдии
+      responses:
+        '200':
+          description: Данные текущей версии; неполнота отражена явно
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GuildProfileResponse' }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/guilds/{region}/{realm}/{name}/roster:
+    parameters:
+      - $ref: '#/components/parameters/RegionPath'
+      - $ref: '#/components/parameters/RealmPath'
+      - name: name
+        in: path
+        required: true
+        description: Канонический slug гильдии, без транслитерации отображаемого имени
+        schema: { type: string, minLength: 2, maxLength: 100 }
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Guilds]
+      operationId: getGuildRoster
+      summary: Наблюдаемый состав гильдии
+      responses:
+        '200':
+          description: Данные текущей версии; неполнота отражена явно
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GuildRosterResponse' }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/guilds/{region}/{realm}/{name}/analysis:
+    parameters:
+      - $ref: '#/components/parameters/RegionPath'
+      - $ref: '#/components/parameters/RealmPath'
+      - name: name
+        in: path
+        required: true
+        description: Канонический slug гильдии, без транслитерации отображаемого имени
+        schema: { type: string, minLength: 2, maxLength: 100 }
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Guilds]
+      operationId: getGuildAnalysis
+      summary: Сводка разрешённых профилей с явным охватом
+      responses:
+        '200':
+          description: Данные текущей версии; неполнота отражена явно
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GuildAnalysisResponse' }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/refresh/guilds:
+    post:
+      tags: [Guilds]
+      operationId: refreshGuild
+      summary: Обновить состав и поставить ограниченные пакеты профилей в очередь
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshGuildRequest' }
+      responses:
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/comparisons/characters:
+    post:
+      tags: [Comparisons]
+      operationId: compareCharacters
+      summary: До пяти различных персонажей с независимыми сроками и контекстами
+      description: 200 может содержать pending/unavailable колонки. HTTP не обращается к провайдеру; отсутствующие профили получают обычные фоновые задания.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [characters]
+              properties:
+                characters: { type: array, minItems: 1, maxItems: 5, items: { $ref: '#/components/schemas/CharacterInput' } }
+                locale: { $ref: '#/components/schemas/Locale' }
+      responses:
+        '200':
+          description: Сопоставленные разрешённые данные без общего рейтинга
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ComparisonResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/meta/realms:
+    get:
+      tags: [Metadata]
+      operationId: listRealms
+      summary: Найти сервер в локальном справочнике Blizzard
+      parameters:
+        - name: region
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/Region' }
+        - $ref: '#/components/parameters/Locale'
+        - name: q
+          in: query
+          description: Префикс имени или slug, после NFC и Unicode case folding; пустая строка допустима
+          schema: { type: string, maxLength: 80 }
+        - name: cursor
+          in: query
+          description: Непрозрачный курсор; связан с region, locale и q. Несовпадение даёт 400.
+          schema: { type: string, minLength: 1, maxLength: 1024 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 30 }
+      responses:
+        '200':
+          description: Страница справочника, стабильная сортировка по slug и provider realm ID
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RealmsResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/jobs/{id}:
+    get:
+      tags: [Jobs]
+      operationId: getJob
+      summary: Получить состояние задания
+      description: >-
+        Существующее завершённое либо неуспешное задание возвращается с 200.
+        Здесь нет payload провайдера, текста внутренних ошибок, секретов, адресов worker
+        и имени персонажа. После удаления персонажа задание удаляется либо обезличивается.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Публичное состояние задания
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/refresh/characters:
+    post:
+      tags: [Characters]
+      operationId: refreshCharacter
+      summary: Поставить ограниченное обновление персонажа в очередь
+      description: >-
+        Все четыре секции обновляются одним заданием. Повторный запрос к тому же ключу
+        получает тот же активный job_id. Параметра force нет. Лимит и cooldown действуют
+        и при повторных запросах. Если все секции свежие, возвращается 200 already_fresh.
+        202 отправляется только после durable commit задания.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+            example: { region: eu, realm: 'гордунни', name: 'Кипет', locale: ru-RU }
+      responses:
+        '200':
+          description: Все секции свежие; новое задание не создано
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FreshRefreshResponse' }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/raiderio/characters/{region}/{realm}/{name}:
+    parameters:
+      - $ref: '#/components/parameters/RegionPath'
+      - name: realm
+        in: path
+        required: true
+        description: Название или slug сервера, разрешаемый Raider.IO.
+        schema: { type: string, minLength: 1, maxLength: 80 }
+      - $ref: '#/components/parameters/NamePath'
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Characters]
+      operationId: getRaiderProfile
+      summary: Публичный профиль Raider.IO
+      responses:
+        '200':
+          description: Пригодный снимок Raider.IO
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta, request_id]
+                additionalProperties: false
+                properties:
+                  data: { $ref: '#/components/schemas/RaiderProfile' }
+                  meta:
+                    allOf:
+                      - $ref: '#/components/schemas/Meta'
+                      - properties:
+                          source: { const: raiderio }
+                  request_id: { type: string, format: uuid }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/refresh/raiderio/characters:
+    post:
+      tags: [Characters]
+      operationId: refreshRaiderProfile
+      summary: Поставить обновление профиля Raider.IO в очередь
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [region, realm, name]
+              additionalProperties: false
+              properties:
+                region: { $ref: '#/components/schemas/Region' }
+                realm: { type: string, minLength: 1, maxLength: 80 }
+                name: { type: string, minLength: 2, maxLength: 24 }
+                locale: { $ref: '#/components/schemas/Locale' }
+      responses:
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/raiderio/guilds/{region}/{realm}/{name}:
+    parameters:
+      - $ref: '#/components/parameters/RegionPath'
+      - name: realm
+        in: path
+        required: true
+        description: Название или slug сервера, разрешаемый Raider.IO.
+        schema: { type: string, minLength: 1, maxLength: 80 }
+      - name: name
+        in: path
+        required: true
+        schema: { type: string, minLength: 2, maxLength: 100 }
+      - $ref: '#/components/parameters/Locale'
+    get:
+      tags: [Guilds]
+      operationId: getRaiderGuildProfile
+      summary: Публичный состав и рейдовый прогресс гильдии Raider.IO
+      responses:
+        '200':
+          description: Пригодный снимок Raider.IO
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta, request_id]
+                additionalProperties: false
+                properties:
+                  data: { $ref: '#/components/schemas/RaiderGuildProfile' }
+                  meta:
+                    allOf:
+                      - $ref: '#/components/schemas/Meta'
+                      - properties:
+                          source: { const: raiderio }
+                  request_id: { type: string, format: uuid }
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/refresh/raiderio/guilds:
+    post:
+      tags: [Guilds]
+      operationId: refreshRaiderGuildProfile
+      summary: Поставить обновление гильдии Raider.IO в очередь
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [region, realm, name]
+              additionalProperties: false
+              properties:
+                region: { $ref: '#/components/schemas/Region' }
+                realm: { type: string, minLength: 1, maxLength: 80 }
+                name: { type: string, minLength: 2, maxLength: 100 }
+                locale: { $ref: '#/components/schemas/Locale' }
+      responses:
+        '202': { $ref: '#/components/responses/Pending' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /metrics:
+    get:
+      tags: [Internal]
+      operationId: getOperationalMetrics
+      x-internal: true
+      summary: Обезличенные агрегаты HTTP, очередей и источников
+      description: >-
+        Только внутренний listener. Prometheus text format; URL, имена, IP и request ID не являются labels.
+        Сбой БД или несовместимый migration ledger даёт 503 и metrics_scrape_success=0.
+      responses:
+        '200':
+          description: Актуальные эксплуатационные метрики
+          content:
+            text/plain:
+              schema: { type: string }
+        '503':
+          description: Scrape не подтверждён; gauge metrics_scrape_success равен нулю
+          content:
+            text/plain:
+              schema: { type: string }
+  /health/live:
+    get:
+      tags: [Internal]
+      operationId: getLiveness
+      x-internal: true
+      summary: Процесс HTTP API работает
+      description: Не проверяет провайдеров, PostgreSQL или Redis; отдельный внутренний listener.
+      responses:
+        '200':
+          description: Процесс принимает запросы
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+  /health/ready:
+    get:
+      tags: [Internal]
+      operationId: getReadiness
+      x-internal: true
+      summary: API готов обслуживать запросы
+      description: >-
+        Проверяет конфигурацию, совместимость схемы и PostgreSQL с коротким timeout.
+        Недоступный Redis допускает degraded mode при сохранении PG-лимитов.
+        Внешние провайдеры не являются синхронной зависимостью readiness.
+      responses:
+        '200':
+          description: Готов, возможно в degraded mode
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+components:
+  parameters:
+    RegionPath:
+      name: region
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Region' }
+    RealmPath:
+      name: realm
+      in: path
+      required: true
+      description: >-
+        Канонический slug, полученный из /meta/realms. Display name (включая кириллицу)
+        разрешается UI через справочник, а не подстановкой в provider URL.
+      schema: { type: string, minLength: 1, maxLength: 80 }
+    NamePath:
+      name: name
+      in: path
+      required: true
+      description: >-
+        Unicode имя. URI decoding ровно один раз, trim, NFC, case folding, повторный NFC для ключа.
+        Приложение дополнительно проверяет Unicode letters/combining marks (2–24 Unicode
+        code points после NFC — предел проекта), запрет control/separators/пунктуации и slash.
+        Диапазоны букв конкретного региона не зашиты; ASCII-only проверки нет.
+      schema: { type: string, minLength: 2, maxLength: 24 }
+    Locale:
+      name: locale
+      in: query
+      description: Язык представления; не является частью идентичности и dedup key
+      schema: { $ref: '#/components/schemas/Locale' }
+  headers:
+    NoStore:
+      description: Не сохранять идентифицируемые ответы в браузерном или CDN кеше
+      schema: { type: string, const: no-store }
+    RequestID:
+      description: Корреляционный идентификатор запроса; не содержит секретов
+      schema: { type: string, format: uuid }
+    RetryAfter:
+      description: Минимальная задержка следующего poll/повтора, секунды
+      schema: { type: integer, minimum: 1 }
+    JobLocation:
+      description: Относительный URL принятого задания на этом origin
+      schema: { type: string, pattern: '^/api/v1/jobs/[0-9a-f-]{36}$' }
+  responses:
+    Pending:
+      description: Задание durably принято; ответа провайдера в этом запросе ещё нет
+      headers:
+        Location: { $ref: '#/components/headers/JobLocation' }
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+        Cache-Control: { $ref: '#/components/headers/NoStore' }
+        X-Request-ID: { $ref: '#/components/headers/RequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/PendingResponse' }
+          example:
+            data: null
+            request_id: 00000000-0000-4000-8000-000000000001
+            meta:
+              source: blizzard
+              fetched_at: null
+              status: pending
+              snapshot_id: null
+              valid_until: null
+              patch: null
+              season: null
+              locale: ru-RU
+              coverage: {}
+              job_id: 00000000-0000-4000-8000-000000000002
+    BadRequest:
+      description: Невалидные параметры, JSON или курсор; INVALID_ARGUMENT
+      headers:
+        Cache-Control: { $ref: '#/components/headers/NoStore' }
+        X-Request-ID: { $ref: '#/components/headers/RequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFound:
+      description: CHARACTER_UNAVAILABLE, REALM_NOT_FOUND или JOB_NOT_FOUND; без старого профиля
+      headers:
+        Cache-Control: { $ref: '#/components/headers/NoStore' }
+        X-Request-ID: { $ref: '#/components/headers/RequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            error:
+              code: CHARACTER_UNAVAILABLE
+              message: Профиль не найден или недоступен.
+              retryable: false
+              retry_after_seconds: null
+              job_id: null
+              fields: []
+            request_id: 00000000-0000-4000-8000-000000000001
+    RateLimited:
+      description: USER_RATE_LIMITED или REFRESH_COOLDOWN; провайдерский 429 не передаётся как пользовательский
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+        Cache-Control: { $ref: '#/components/headers/NoStore' }
+        X-Request-ID: { $ref: '#/components/headers/RequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    InternalError:
+      description: INTERNAL_ERROR; безопасное сообщение без внутренних деталей
+      headers:
+        Cache-Control: { $ref: '#/components/headers/NoStore' }
+        X-Request-ID: { $ref: '#/components/headers/RequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    BadGateway:
+      description: PROVIDER_INVALID_RESPONSE, PROVIDER_ACCESS_DENIED или PROVIDER_AUTH_FAILURE; после terminal failure без пригодных данных либо при quarantine
+      headers:
+        Cache-Control: { $ref: '#/components/headers/NoStore' }
+        X-Request-ID: { $ref: '#/components/headers/RequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Unavailable:
+      description: PROVIDER_UNAVAILABLE, INFRASTRUCTURE_UNAVAILABLE или QUEUE_FULL; без пригодных данных/без приёма задания
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+        Cache-Control: { $ref: '#/components/headers/NoStore' }
+        X-Request-ID: { $ref: '#/components/headers/RequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    PayloadTooLarge:
+      description: REQUEST_TOO_LARGE; тело больше 4 KiB
+      headers:
+        Cache-Control: { $ref: '#/components/headers/NoStore' }
+        X-Request-ID: { $ref: '#/components/headers/RequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    UnsupportedMediaType:
+      description: UNSUPPORTED_MEDIA_TYPE; требуется application/json
+      headers:
+        Cache-Control: { $ref: '#/components/headers/NoStore' }
+        X-Request-ID: { $ref: '#/components/headers/RequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  schemas:
+    RaiderProfile:
+      type: object
+      additionalProperties: false
+      required: [name, region, realm, profile_url, race, class, specialization, role, faction, last_crawled_at, gear, talents, mythic_plus, raids, coverage]
+      properties:
+        name: { type: string }
+        region: { $ref: '#/components/schemas/Region' }
+        realm: { $ref: '#/components/schemas/RaiderRealm' }
+        profile_url: { type: string, format: uri }
+        race: { type: [string, 'null'] }
+        class: { type: [string, 'null'] }
+        specialization: { type: [string, 'null'] }
+        role: { type: [string, 'null'] }
+        faction: { type: [string, 'null'] }
+        last_crawled_at: { type: [string, 'null'], format: date-time }
+        gear:
+          type: [object, 'null']
+          additionalProperties: false
+          required: [equipped_item_level, total_item_level, updated_at, items]
+          properties:
+            equipped_item_level: { type: [number, 'null'], minimum: 0 }
+            total_item_level: { type: [number, 'null'], minimum: 0 }
+            updated_at: { type: [string, 'null'], format: date-time }
+            items:
+              type: [array, 'null']
+              items:
+                type: object
+                required: [slot, item_id, name, item_level, quality, enchant_ids, enchantments, gem_ids, bonus_ids]
+                additionalProperties: false
+                properties:
+                  slot: { type: string }
+                  item_id: { $ref: '#/components/schemas/ProviderID' }
+                  name: { type: [string, 'null'] }
+                  item_level: { type: [number, 'null'], minimum: 0 }
+                  quality: { type: [integer, 'null'] }
+                  enchant_ids: { type: [array, 'null'], items: { $ref: '#/components/schemas/ProviderID' } }
+                  enchantments: { type: [array, 'null'], items: { $ref: '#/components/schemas/NamedID' } }
+                  gem_ids: { type: [array, 'null'], items: { $ref: '#/components/schemas/ProviderID' } }
+                  bonus_ids: { type: [array, 'null'], items: { $ref: '#/components/schemas/ProviderID' } }
+        talents:
+          type: [object, 'null']
+          additionalProperties: false
+          required: [export_code, specialization_id]
+          properties:
+            export_code: { type: [string, 'null'] }
+            specialization_id: { $ref: '#/components/schemas/NullableProviderID' }
+        mythic_plus:
+          type: [object, 'null']
+          additionalProperties: false
+          required: [season, rating, scores, best_runs]
+          properties:
+            season: { type: [string, 'null'] }
+            rating: { type: [number, 'null'], minimum: 0 }
+            scores: { type: [object, 'null'], additionalProperties: { type: [number, 'null'], minimum: 0 } }
+            best_runs:
+              type: [array, 'null']
+              items:
+                type: object
+                required: [dungeon, level, duration_ms, par_time_ms, timed, score, completed_at, url]
+                additionalProperties: false
+                properties:
+                  dungeon: { type: string }
+                  level: { type: integer, minimum: 1 }
+                  duration_ms: { type: [integer, 'null'], minimum: 0 }
+                  par_time_ms: { type: [integer, 'null'], minimum: 0 }
+                  timed: { type: [boolean, 'null'] }
+                  score: { type: [number, 'null'], minimum: 0 }
+                  completed_at: { type: [string, 'null'], format: date-time }
+                  url: { type: [string, 'null'], format: uri }
+        raids: { $ref: '#/components/schemas/RaiderRaids' }
+        coverage: { $ref: '#/components/schemas/RaiderCoverage' }
+        guild:
+          type: object
+          additionalProperties: false
+          required: [name, realm]
+          properties:
+            name: { type: string }
+            realm: { type: string }
+    RaiderGuildProfile:
+      type: object
+      additionalProperties: false
+      required: [name, region, realm, profile_url, faction, last_crawled_at, members, raids, rankings, coverage]
+      properties:
+        name: { type: string }
+        region: { $ref: '#/components/schemas/Region' }
+        realm: { $ref: '#/components/schemas/RaiderRealm' }
+        profile_url: { type: string, format: uri }
+        faction: { type: [string, 'null'] }
+        last_crawled_at: { type: [string, 'null'], format: date-time }
+        members:
+          type: [array, 'null']
+          items:
+            type: object
+            required: [key, rank, class, specialization, role]
+            additionalProperties: false
+            properties:
+              key:
+                type: object
+                additionalProperties: false
+                required: [region, realm, name]
+                properties:
+                  region: { $ref: '#/components/schemas/Region' }
+                  realm: { type: string }
+                  name: { type: string }
+              rank: { type: [integer, 'null'], minimum: 0 }
+              class: { type: [string, 'null'] }
+              specialization: { type: [string, 'null'] }
+              role: { type: [string, 'null'] }
+        raids: { $ref: '#/components/schemas/RaiderRaids' }
+        rankings:
+          type: [object, 'null']
+          additionalProperties:
+            type: object
+            additionalProperties:
+              type: object
+              required: [world, region, realm]
+              additionalProperties: false
+              properties:
+                world: { type: [integer, 'null'], minimum: 0 }
+                region: { type: [integer, 'null'], minimum: 0 }
+                realm: { type: [integer, 'null'], minimum: 0 }
+        coverage: { $ref: '#/components/schemas/RaiderCoverage' }
+    RaiderRealm:
+      type: object
+      required: [name, slug]
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        slug: { type: string }
+    RaiderRaids:
+      type: [array, 'null']
+      items:
+        type: object
+        required: [slug, expansion_id, summary, total_bosses, normal_bosses_killed, heroic_bosses_killed, mythic_bosses_killed]
+        additionalProperties: false
+        properties:
+          slug: { type: string }
+          expansion_id: { $ref: '#/components/schemas/NullableProviderID' }
+          summary: { type: [string, 'null'] }
+          total_bosses: { type: [integer, 'null'], minimum: 0 }
+          normal_bosses_killed: { type: [integer, 'null'], minimum: 0 }
+          heroic_bosses_killed: { type: [integer, 'null'], minimum: 0 }
+          mythic_bosses_killed: { type: [integer, 'null'], minimum: 0 }
+    RaiderCoverage:
+      type: object
+      additionalProperties:
+        type: object
+        required: [state, reason, source_updated_at]
+        additionalProperties: false
+        properties:
+          state: { enum: [complete, partial, unavailable] }
+          reason: { type: [string, 'null'] }
+          source_updated_at: { type: [string, 'null'], format: date-time }
+    AnalysisContext:
+      type: object
+      additionalProperties: false
+      required: [patch, season, class_id, specialization_id, content]
+      properties:
+        patch: { type: [string, 'null'] }
+        season: { $ref: '#/components/schemas/NullableProviderID' }
+        class_id: { $ref: '#/components/schemas/NullableProviderID' }
+        specialization_id: { $ref: '#/components/schemas/NullableProviderID' }
+        content: { type: string, enum: [general_pve, raid, mythic_plus] }
+    AnalysisReference:
+      type: object
+      additionalProperties: false
+      required: [id, title, url]
+      properties:
+        id: { type: string, minLength: 1 }
+        title: { type: string, minLength: 1 }
+        url: { type: string, format: uri }
+    AnalysisRuleset:
+      type: object
+      additionalProperties: false
+      required: [version, digest, synthetic, reviewed_at, reviewed_by, references]
+      properties:
+        version: { type: string, minLength: 1 }
+        digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        synthetic: { type: boolean }
+        reviewed_at: { type: string, format: date-time }
+        reviewed_by: { type: string, minLength: 1 }
+        references:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/AnalysisReference' }
+    AnalysisEvidence:
+      type: object
+      additionalProperties: false
+      required: [section, path, value, fetched_at, reference]
+      properties:
+        section: { type: string, enum: [profile, equipment, statistics, talents] }
+        path: { type: string }
+        value: {}
+        fetched_at: { $ref: '#/components/schemas/NullableTime' }
+        reference: { type: [string, 'null'] }
+    AnalysisResult:
+      type: object
+      additionalProperties: false
+      required: [rule_id, rule_version, applicability, outcome, confidence, confidence_reason, reason_code, message_key, params, evidence]
+      properties:
+        rule_id: { type: string, enum: [GEAR_MISSING_ENCHANT, GEAR_SET_BONUS, TALENT_BUILD_DIFF] }
+        rule_version: { type: string, minLength: 1 }
+        applicability: { type: string, enum: [applicable, not_applicable, unknown] }
+        outcome: { type: [string, 'null'], enum: [OK, Info, Warning, Critical, Unknown, null] }
+        confidence: { type: string, enum: [high, medium, unknown] }
+        confidence_reason: { type: string }
+        reason_code: { type: string, minLength: 1 }
+        message_key: { type: string, minLength: 1 }
+        params: { type: object }
+        evidence:
+          type: array
+          items: { $ref: '#/components/schemas/AnalysisEvidence' }
+      allOf:
+        - if:
+            properties: { applicability: { const: not_applicable } }
+          then:
+            properties: { outcome: { type: 'null' } }
+        - if:
+            properties: { applicability: { const: unknown } }
+          then:
+            properties: { outcome: { const: Unknown }, confidence: { const: unknown } }
+    AnalysisDiagnostic:
+      type: object
+      additionalProperties: false
+      required: [code, section, message_key, params, evidence]
+      properties:
+        code: { type: string, minLength: 1 }
+        section: { type: [string, 'null'], enum: [profile, equipment, statistics, talents, null] }
+        message_key: { type: string, minLength: 1 }
+        params: { type: object }
+        evidence:
+          type: array
+          items: { $ref: '#/components/schemas/AnalysisEvidence' }
+    AnalysisReport:
+      type: object
+      additionalProperties: false
+      required: [snapshot_id, source, evaluated_at, context, ruleset, summary, results, diagnostics]
+      properties:
+        snapshot_id: { type: string, format: uuid }
+        source: { type: string, enum: [fixture, blizzard] }
+        evaluated_at: { type: string, format: date-time }
+        context: { $ref: '#/components/schemas/AnalysisContext' }
+        ruleset:
+          anyOf:
+            - $ref: '#/components/schemas/AnalysisRuleset'
+            - type: 'null'
+        summary:
+          type: object
+          additionalProperties: false
+          required: [ok, info, warning, critical, unknown, not_applicable]
+          properties:
+            ok: { type: integer, minimum: 0 }
+            info: { type: integer, minimum: 0 }
+            warning: { type: integer, minimum: 0 }
+            critical: { type: integer, minimum: 0 }
+            unknown: { type: integer, minimum: 0 }
+            not_applicable: { type: integer, minimum: 0 }
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/AnalysisResult' }
+        diagnostics:
+          type: array
+          items: { $ref: '#/components/schemas/AnalysisDiagnostic' }
+    AnalysisResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data: { $ref: '#/components/schemas/AnalysisReport' }
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    Region: { type: string, enum: [eu, us] }
+    Locale: { type: string, enum: [ru-RU, en-US], default: ru-RU }
+    ProviderID:
+      type: string
+      pattern: '^[1-9][0-9]{0,18}$'
+      description: Положительный ID провайдера; десятичная строка, проверяемая в пределах int64
+    NullableTime: { type: [string, 'null'], format: date-time }
+    NullableUUID: { type: [string, 'null'], format: uuid }
+    NullableProviderID:
+      anyOf:
+        - $ref: '#/components/schemas/ProviderID'
+        - type: 'null'
+    CoverageSection:
+      type: object
+      additionalProperties: false
+      required: [state, fetched_at, fresh_until, valid_until, reason]
+      allOf:
+        - if:
+            properties:
+              state: { enum: [complete, partial] }
+          then:
+            properties:
+              fetched_at: { type: string, format: date-time }
+              fresh_until: { type: string, format: date-time }
+              valid_until: { type: string, format: date-time }
+        - if:
+            properties:
+              state: { const: complete }
+          then:
+            properties:
+              reason: { type: 'null' }
+          else:
+            properties:
+              reason: { type: string }
+        - if:
+            properties:
+              state: { const: unavailable }
+          then:
+            properties:
+              fetched_at: { type: 'null' }
+              fresh_until: { type: 'null' }
+              valid_until: { type: 'null' }
+      properties:
+        state: { type: string, enum: [complete, partial, unavailable] }
+        fetched_at: { $ref: '#/components/schemas/NullableTime' }
+        fresh_until: { $ref: '#/components/schemas/NullableTime' }
+        valid_until: { $ref: '#/components/schemas/NullableTime' }
+        reason:
+          type: [string, 'null']
+          enum: [null, never_fetched, provider_unavailable, not_provided, invalid_response, expired]
+    Coverage:
+      type: object
+      additionalProperties: false
+      properties:
+        profile: { $ref: '#/components/schemas/CoverageSection' }
+        equipment: { $ref: '#/components/schemas/CoverageSection' }
+        statistics: { $ref: '#/components/schemas/CoverageSection' }
+        talents: { $ref: '#/components/schemas/CoverageSection' }
+        mythic_plus: { $ref: '#/components/schemas/CoverageSection' }
+        raids: { $ref: '#/components/schemas/CoverageSection' }
+        report: { $ref: '#/components/schemas/CoverageSection' }
+        combat: { $ref: '#/components/schemas/CoverageSection' }
+        guild: { $ref: '#/components/schemas/CoverageSection' }
+        roster: { $ref: '#/components/schemas/CoverageSection' }
+        realms: { $ref: '#/components/schemas/CoverageSection' }
+    Meta:
+      type: object
+      additionalProperties: false
+      required: [source, fetched_at, status, snapshot_id, valid_until, patch, season, locale, coverage, job_id]
+      properties:
+        source: { type: string, enum: [blizzard, fixture, system, warcraftlogs, raiderio] }
+        fetched_at: { $ref: '#/components/schemas/NullableTime' }
+        status: { type: string, enum: [fresh, stale, pending, unavailable] }
+        snapshot_id: { $ref: '#/components/schemas/NullableUUID' }
+        valid_until: { $ref: '#/components/schemas/NullableTime' }
+        patch:
+          type: [string, 'null']
+          maxLength: 40
+          description: Подтверждённая версия игровых данных; null если неизвестна, не дата нашего релиза
+        season:
+          anyOf:
+            - $ref: '#/components/schemas/ProviderID'
+            - type: 'null'
+        locale: { $ref: '#/components/schemas/Locale' }
+        coverage: { $ref: '#/components/schemas/Coverage' }
+        job_id: { $ref: '#/components/schemas/NullableUUID' }
+    NamedID:
+      type: object
+      additionalProperties: false
+      required: [id, name]
+      properties:
+        id: { $ref: '#/components/schemas/ProviderID' }
+        name: { type: [string, 'null'], maxLength: 200 }
+    Realm:
+      type: object
+      additionalProperties: false
+      required: [id, region, slug, name, connected_realm_id]
+      properties:
+        id: { $ref: '#/components/schemas/ProviderID' }
+        region: { $ref: '#/components/schemas/Region' }
+        slug: { type: string, minLength: 1, maxLength: 80 }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        connected_realm_id: { $ref: '#/components/schemas/NullableProviderID' }
+    Character:
+      type: object
+      additionalProperties: false
+      required: [id, provider_id, region, realm, name, name_normalized, level, race, character_class, active_specialization, faction, average_item_level, equipped_item_level, source_last_login_at]
+      properties:
+        id: { type: string, format: uuid }
+        provider_id: { $ref: '#/components/schemas/ProviderID' }
+        region: { $ref: '#/components/schemas/Region' }
+        realm: { $ref: '#/components/schemas/Realm' }
+        name: { type: string, minLength: 1, maxLength: 24 }
+        name_normalized: { type: string, minLength: 1, maxLength: 48 }
+        level: { type: integer, minimum: 1, maximum: 1000 }
+        race: { $ref: '#/components/schemas/NamedID' }
+        character_class: { $ref: '#/components/schemas/NamedID' }
+        active_specialization:
+          anyOf:
+            - $ref: '#/components/schemas/NamedID'
+            - type: 'null'
+        faction: { type: string, enum: [alliance, horde, neutral, unknown] }
+        average_item_level: { type: [number, 'null'], minimum: 0, maximum: 100000 }
+        equipped_item_level: { type: [number, 'null'], minimum: 0, maximum: 100000 }
+        source_last_login_at: { $ref: '#/components/schemas/NullableTime' }
+    Equipment:
+      type: object
+      additionalProperties: false
+      required: [character_id, items]
+      properties:
+        character_id: { type: string, format: uuid }
+        items:
+          type: array
+          maxItems: 32
+          description: >-
+            Только полученные предметы; отсутствующий off_hand не считается ошибкой.
+            Лимит 32 ограничивает размер ресурса и не утверждает число игровых слотов.
+          items: { $ref: '#/components/schemas/EquipmentItem' }
+    EquipmentItem:
+      type: object
+      additionalProperties: false
+      required: [slot, item_id, name, item_level, quality, inventory_type, bonus_ids, enchantments, sockets, set_id]
+      properties:
+        slot:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: >-
+            Известные нормализованные значения: head, neck, shoulder, back, chest, wrist,
+            hands, waist, legs, feet, finger_1, finger_2, trinket_1, trinket_2, main_hand,
+            off_hand, shirt, tabard. Неизвестный нормализованный slot провайдера сохраняется
+            как отдельное значение; предмет не отбрасывается и не переносится в другой slot.
+        item_id: { $ref: '#/components/schemas/ProviderID' }
+        name: { type: [string, 'null'], maxLength: 300 }
+        item_level: { type: [integer, 'null'], minimum: 0, maximum: 100000 }
+        quality: { type: string, enum: [poor, common, uncommon, rare, epic, legendary, artifact, heirloom, unknown] }
+        inventory_type:
+          type: [string, 'null']
+          maxLength: 80
+          description: Нормализованное исходное значение inventory_type; не выводить валидность слота без каталога
+        bonus_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/ProviderID' }
+        enchantments:
+          type: [array, 'null']
+          maxItems: 20
+          description: null — источник не сообщил поле; [] — известно, что зачарований нет
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, display]
+            properties:
+              id: { $ref: '#/components/schemas/ProviderID' }
+              display: { type: [string, 'null'], maxLength: 500 }
+        sockets:
+          type: [array, 'null']
+          maxItems: 10
+          description: null — неизвестны; [] — известно, что сокетов нет; item_id:null — известный пустой сокет
+          items:
+            type: object
+            additionalProperties: false
+            required: [type, item_id]
+            properties:
+              type: { type: string, minLength: 1, maxLength: 80 }
+              item_id: { $ref: '#/components/schemas/NullableProviderID' }
+        set_id: { $ref: '#/components/schemas/NullableProviderID' }
+    Statistics:
+      type: object
+      additionalProperties: false
+      required: [character_id, health, primary, secondary]
+      properties:
+        character_id: { type: string, format: uuid }
+        health: { type: [integer, 'null'], minimum: 0, maximum: 9007199254740991 }
+        primary:
+          type: object
+          additionalProperties: false
+          required: [strength, agility, intellect, stamina]
+          properties:
+            strength: { $ref: '#/components/schemas/NullableStatValue' }
+            agility: { $ref: '#/components/schemas/NullableStatValue' }
+            intellect: { $ref: '#/components/schemas/NullableStatValue' }
+            stamina: { $ref: '#/components/schemas/NullableStatValue' }
+        secondary:
+          type: object
+          additionalProperties: false
+          required: [critical_strike, haste, mastery, versatility]
+          properties:
+            critical_strike: { $ref: '#/components/schemas/AttackTypeStats' }
+            haste: { $ref: '#/components/schemas/AttackTypeStats' }
+            mastery: { $ref: '#/components/schemas/SecondaryStat' }
+            versatility:
+              type: object
+              additionalProperties: false
+              required: [rating, damage_done_percent, healing_done_percent, damage_taken_reduction_percent]
+              properties:
+                rating: { $ref: '#/components/schemas/NullableStatValue' }
+                damage_done_percent: { $ref: '#/components/schemas/NullablePercent' }
+                healing_done_percent: { $ref: '#/components/schemas/NullablePercent' }
+                damage_taken_reduction_percent: { $ref: '#/components/schemas/NullablePercent' }
+    NullableStatValue: { type: [number, 'null'], minimum: 0, maximum: 9007199254740991 }
+    NullablePercent:
+      type: [number, 'null']
+      minimum: -100
+      maximum: 100000
+      description: Процентные пункты источника, например 23.5; не доля 0–1
+    AttackTypeStats:
+      type: object
+      additionalProperties: false
+      required: [melee, ranged, spell]
+      properties:
+        melee: { $ref: '#/components/schemas/SecondaryStat' }
+        ranged: { $ref: '#/components/schemas/SecondaryStat' }
+        spell: { $ref: '#/components/schemas/SecondaryStat' }
+    SecondaryStat:
+      type: object
+      additionalProperties: false
+      required: [rating, percent]
+      properties:
+        rating: { $ref: '#/components/schemas/NullableStatValue' }
+        percent: { $ref: '#/components/schemas/NullablePercent' }
+    Talents:
+      type: object
+      additionalProperties: false
+      required: [character_id, loadouts]
+      properties:
+        character_id: { type: string, format: uuid }
+        loadouts:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/TalentLoadout' }
+    TalentLoadout:
+      type: object
+      additionalProperties: false
+      required: [provider_id, specialization, is_active, export_code, tree_hash, nodes]
+      properties:
+        provider_id:
+          type: [string, 'null']
+          pattern: '^(0|[1-9][0-9]{0,18})$'
+          description: ID loadout, если предоставлен; допускается 0, предел int64 проверяется приложением
+        specialization: { $ref: '#/components/schemas/NamedID' }
+        is_active:
+          type: [boolean, 'null']
+          description: true/false только при подтверждённой активности; null — источник не сообщил
+        export_code: { type: [string, 'null'], maxLength: 4096 }
+        tree_hash: { type: [string, 'null'], maxLength: 200 }
+        nodes:
+          type: [array, 'null']
+          maxItems: 300
+          description: null — узлы неизвестны; [] — подтверждённо пустой набор, не fallback для отсутствующих данных
+          items:
+            type: object
+            additionalProperties: false
+            required: [node_id, entry_id, spell_id, rank, tree]
+            properties:
+              node_id: { $ref: '#/components/schemas/ProviderID' }
+              entry_id: { $ref: '#/components/schemas/NullableProviderID' }
+              spell_id: { $ref: '#/components/schemas/NullableProviderID' }
+              rank: { type: integer, minimum: 1, maximum: 100 }
+              tree: { type: string, enum: [class, specialization, hero, unknown] }
+    ProgressSeason:
+      type: object
+      additionalProperties: false
+      required: [id, name, is_current]
+      properties:
+        id: { $ref: '#/components/schemas/ProviderID' }
+        name: { type: [string, 'null'], maxLength: 200 }
+        is_current:
+          type: [boolean, 'null']
+          description: null, если источник не подтвердил текущий сезон; выбор максимального ID запрещён
+    MythicPlus:
+      type: object
+      additionalProperties: false
+      required: [character_id, season, rating, run_scope, best_runs, available_seasons]
+      properties:
+        character_id: { type: string, format: uuid }
+        season:
+          anyOf:
+            - $ref: '#/components/schemas/ProgressSeason'
+            - type: 'null'
+        rating: { $ref: '#/components/schemas/NullableStatValue' }
+        run_scope: { type: string, enum: [season_best, current_period_best, unknown] }
+        best_runs:
+          type: [array, 'null']
+          description: Лучшие наблюдаемые прохождения в пределах run_scope; null неизвестно, [] подтверждённо пусто
+          items: { $ref: '#/components/schemas/MythicRun' }
+        available_seasons:
+          type: [array, 'null']
+          description: Сезоны, наблюдаемые в индексе персонажа; публичного выбора истории пока нет
+          items: { $ref: '#/components/schemas/ProgressSeason' }
+    MythicRun:
+      type: object
+      additionalProperties: false
+      required: [dungeon, keystone_level, duration_ms, completed_at, within_time, rating]
+      properties:
+        dungeon: { $ref: '#/components/schemas/NamedID' }
+        keystone_level: { type: integer, minimum: 1, maximum: 1000 }
+        duration_ms: { type: [integer, 'null'], minimum: 0, maximum: 9007199254740991 }
+        completed_at: { $ref: '#/components/schemas/NullableTime' }
+        within_time: { type: [boolean, 'null'] }
+        rating: { $ref: '#/components/schemas/NullableStatValue' }
+    Raids:
+      type: object
+      additionalProperties: false
+      required: [character_id, expansions]
+      properties:
+        character_id: { type: string, format: uuid }
+        expansions:
+          type: [array, 'null']
+          items: { $ref: '#/components/schemas/RaidExpansion' }
+    RaidExpansion:
+      type: object
+      additionalProperties: false
+      required: [id, name, instances]
+      properties:
+        id: { $ref: '#/components/schemas/ProviderID' }
+        name: { type: [string, 'null'], maxLength: 200 }
+        instances:
+          type: [array, 'null']
+          items: { $ref: '#/components/schemas/RaidInstance' }
+    RaidInstance:
+      type: object
+      additionalProperties: false
+      required: [id, name, modes]
+      properties:
+        id: { $ref: '#/components/schemas/ProviderID' }
+        name: { type: [string, 'null'], maxLength: 200 }
+        modes:
+          type: [array, 'null']
+          items: { $ref: '#/components/schemas/RaidMode' }
+    RaidMode:
+      type: object
+      additionalProperties: false
+      required: [difficulty, status, completed, total, encounters]
+      properties:
+        difficulty: { type: string, minLength: 1, maxLength: 80 }
+        status: { type: string, minLength: 1, maxLength: 80 }
+        completed: { type: [integer, 'null'], minimum: 0, maximum: 9007199254740991 }
+        total: { type: [integer, 'null'], minimum: 0, maximum: 9007199254740991 }
+        encounters:
+          type: [array, 'null']
+          items: { $ref: '#/components/schemas/RaidEncounter' }
+    RaidEncounter:
+      type: object
+      additionalProperties: false
+      required: [id, name, completed_count, last_kill_at]
+      properties:
+        id: { $ref: '#/components/schemas/ProviderID' }
+        name: { type: [string, 'null'], maxLength: 200 }
+        completed_count: { type: [integer, 'null'], minimum: 0, maximum: 9007199254740991 }
+        last_kill_at: { $ref: '#/components/schemas/NullableTime' }
+    ReportCode: { type: string, pattern: '^[A-Za-z0-9]{16}$' }
+    CombatID: { type: integer, minimum: 1, maximum: 2147483647 }
+    CombatActor:
+      type: object
+      additionalProperties: false
+      required: [id, name, type, sub_type]
+      properties:
+        id: { $ref: '#/components/schemas/CombatID' }
+        name: { type: [string, 'null'], maxLength: 200 }
+        type: { type: string, maxLength: 80 }
+        sub_type: { type: [string, 'null'], maxLength: 200 }
+    CombatFight:
+      type: object
+      additionalProperties: false
+      required: [id, name, encounter_id, difficulty, kill, start_ms, end_ms, participant_ids]
+      properties:
+        id: { $ref: '#/components/schemas/CombatID' }
+        name: { type: [string, 'null'], maxLength: 200 }
+        encounter_id: { $ref: '#/components/schemas/NullableProviderID' }
+        difficulty: { type: [integer, 'null'], minimum: 0, maximum: 2147483647 }
+        kill: { type: [boolean, 'null'] }
+        start_ms: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        end_ms: { type: integer, minimum: 1, maximum: 9007199254740991 }
+        participant_ids:
+          type: [array, 'null']
+          uniqueItems: true
+          description: Подтверждённые участники боя; null означает, что источник не сообщил состав
+          items: { $ref: '#/components/schemas/CombatID' }
+    PublicReport:
+      type: object
+      additionalProperties: false
+      required: [code, title, start_time, end_time, visibility, fights, actors]
+      properties:
+        code: { $ref: '#/components/schemas/ReportCode' }
+        title: { type: [string, 'null'], maxLength: 200 }
+        start_time: { $ref: '#/components/schemas/NullableTime' }
+        end_time: { $ref: '#/components/schemas/NullableTime' }
+        visibility: { type: string, const: public }
+        fights: { type: [array, 'null'], items: { $ref: '#/components/schemas/CombatFight' } }
+        actors: { type: [array, 'null'], items: { $ref: '#/components/schemas/CombatActor' } }
+    ReportFights:
+      type: object
+      additionalProperties: false
+      required: [report_code, fights, actors]
+      properties:
+        report_code: { $ref: '#/components/schemas/ReportCode' }
+        fights: { type: [array, 'null'], items: { $ref: '#/components/schemas/CombatFight' } }
+        actors: { type: [array, 'null'], items: { $ref: '#/components/schemas/CombatActor' } }
+    CombatEvent:
+      type: object
+      additionalProperties: false
+      required: [timestamp_ms, kind, source_id, target_id, ability_id, amount, overheal]
+      properties:
+        timestamp_ms: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        kind: { type: string, enum: [damage, heal, cast, interrupt, death, applybuff, refreshbuff, removebuff, other, unknown] }
+        source_id: { type: [integer, 'null'], minimum: 1, maximum: 2147483647 }
+        target_id: { type: [integer, 'null'], minimum: 1, maximum: 2147483647 }
+        ability_id: { $ref: '#/components/schemas/NullableProviderID' }
+        amount: { $ref: '#/components/schemas/NullableStatValue' }
+        overheal: { $ref: '#/components/schemas/NullableStatValue' }
+    CombatMetrics:
+      type: object
+      additionalProperties: false
+      required: [damage_total, healing_total, dps, hps, overheal_total, overheal_percent, casts, interrupts, deaths]
+      properties:
+        damage_total: { $ref: '#/components/schemas/NullableStatValue' }
+        healing_total: { $ref: '#/components/schemas/NullableStatValue' }
+        dps: { $ref: '#/components/schemas/NullableStatValue' }
+        hps: { $ref: '#/components/schemas/NullableStatValue' }
+        overheal_total: { $ref: '#/components/schemas/NullableStatValue' }
+        overheal_percent: { type: [number, 'null'], minimum: 0, maximum: 100 }
+        casts: { type: [integer, 'null'], minimum: 0, maximum: 10000 }
+        interrupts: { type: [integer, 'null'], minimum: 0, maximum: 10000 }
+        deaths: { type: [integer, 'null'], minimum: 0, maximum: 10000 }
+    CombatAnalysis:
+      type: object
+      additionalProperties: false
+      required: [report_code, fight_id, actor_id, fight_start_ms, fight_end_ms, duration_ms, method, source, events_complete, timeline_truncated, metrics, abilities, timeline, findings]
+      properties:
+        report_code: { $ref: '#/components/schemas/ReportCode' }
+        fight_id: { $ref: '#/components/schemas/CombatID' }
+        actor_id: { $ref: '#/components/schemas/CombatID' }
+        fight_start_ms: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        fight_end_ms: { type: integer, minimum: 1, maximum: 9007199254740991 }
+        duration_ms: { type: integer, minimum: 1, maximum: 9007199254740991 }
+        method: { type: string, const: event-amounts/whole-fight-v1 }
+        source: { type: string, enum: [fixture, warcraftlogs] }
+        events_complete: { type: boolean }
+        timeline_truncated: { type: boolean }
+        metrics: { $ref: '#/components/schemas/CombatMetrics' }
+        combatant_stats: { $ref: '#/components/schemas/CombatantStats' }
+        abilities:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, casts, damage, healing]
+            properties:
+              id: { $ref: '#/components/schemas/ProviderID' }
+              casts: { type: integer, minimum: 0, maximum: 10000 }
+              damage: { $ref: '#/components/schemas/NullableStatValue' }
+              healing: { $ref: '#/components/schemas/NullableStatValue' }
+        timeline:
+          type: array
+          maxItems: 500
+          items: { $ref: '#/components/schemas/CombatEvent' }
+        findings:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [code, outcome, event_indexes]
+            properties:
+              code: { type: string, minLength: 1, maxLength: 80 }
+              outcome: { type: string, enum: [Info, Unknown] }
+              event_indexes:
+                type: array
+                items: { type: integer, minimum: 0, maximum: 499 }
+    CombatantStats:
+      type: object
+      description: Снимок характеристик выбранного участника из одного события в пределах боя.
+      additionalProperties: false
+      required: [observed_at_ms, values]
+      properties:
+        observed_at_ms:
+          description: Время события в миллисекундах от начала отчёта.
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+        values:
+          description: Наблюдаемые значения источника. Отсутствующий ключ обозначает неизвестное значение.
+          type: object
+          minProperties: 1
+          propertyNames:
+            enum: [strength, agility, intellect, stamina, critical_strike, critical_strike_melee, critical_strike_ranged, critical_strike_spell, haste, haste_melee, haste_ranged, haste_spell, mastery, versatility, versatility_damage_done, versatility_healing_done, versatility_damage_reduction]
+          additionalProperties: { type: number, minimum: 0, maximum: 9007199254740991 }
+    CharacterInput:
+      type: object
+      additionalProperties: false
+      required: [region, realm, name]
+      properties:
+        region: { $ref: '#/components/schemas/Region' }
+        realm: { type: string, minLength: 1, maxLength: 80 }
+        name: { type: string, minLength: 2, maxLength: 24 }
+    RefreshGuildRequest:
+      type: object
+      additionalProperties: false
+      required: [region, realm, name]
+      properties:
+        region: { $ref: '#/components/schemas/Region' }
+        realm: { type: string, minLength: 1, maxLength: 80 }
+        name: { type: string, minLength: 2, maxLength: 100 }
+        locale: { $ref: '#/components/schemas/Locale' }
+    GuildProfile:
+      type: object
+      additionalProperties: false
+      required: [id, provider_id, region, realm, slug, name, faction, member_count, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        provider_id: { $ref: '#/components/schemas/ProviderID' }
+        region: { $ref: '#/components/schemas/Region' }
+        realm: { $ref: '#/components/schemas/Realm' }
+        slug: { type: string, minLength: 2, maxLength: 100 }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        faction: { type: string, enum: [alliance, horde, neutral, unknown] }
+        member_count: { type: [integer, 'null'], minimum: 0, maximum: 100000 }
+        created_at: { $ref: '#/components/schemas/NullableTime' }
+    GuildMember:
+      type: object
+      additionalProperties: false
+      required: [key, provider_id, character_class, level, rank]
+      properties:
+        key: { $ref: '#/components/schemas/CharacterInput' }
+        provider_id: { $ref: '#/components/schemas/ProviderID' }
+        character_class:
+          anyOf:
+            - $ref: '#/components/schemas/NamedID'
+            - type: 'null'
+        level: { type: [integer, 'null'], minimum: 0, maximum: 1000 }
+        rank: { type: [integer, 'null'], minimum: 0, maximum: 1000 }
+    GuildRoster:
+      type: object
+      additionalProperties: false
+      required: [guild_id, members, reported_count]
+      properties:
+        guild_id: { type: string, format: uuid }
+        members: { type: [array, 'null'], maxItems: 1000, items: { $ref: '#/components/schemas/GuildMember' } }
+        reported_count: { type: [integer, 'null'], minimum: 0, maximum: 100000 }
+    Distribution:
+      type: object
+      additionalProperties: false
+      required: [id, name, count]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 100 }
+        name: { type: [string, 'null'], maxLength: 200 }
+        count: { type: integer, minimum: 0, maximum: 1000 }
+    GuildMemberSummary:
+      type: object
+      additionalProperties: false
+      required: [member, status, snapshot_id, specialization, role, item_level, mythic_rating, mythic_season, notices]
+      properties:
+        member: { $ref: '#/components/schemas/GuildMember' }
+        status: { type: string, enum: [pending, fresh, stale, unavailable] }
+        snapshot_id: { $ref: '#/components/schemas/NullableUUID' }
+        specialization:
+          anyOf:
+            - $ref: '#/components/schemas/NamedID'
+            - type: 'null'
+        role: { type: [string, 'null'], enum: [null, tank, healer, damage] }
+        item_level: { $ref: '#/components/schemas/NullableStatValue' }
+        mythic_rating: { $ref: '#/components/schemas/NullableStatValue' }
+        mythic_season: { $ref: '#/components/schemas/NullableProviderID' }
+        notices: { type: [integer, 'null'], minimum: 0 }
+    GuildAnalysis:
+      type: object
+      additionalProperties: false
+      required: [guild_id, coverage, classes, specializations, roles, item_level, gear, progress, members, limitations]
+      properties:
+        guild_id: { type: string, format: uuid }
+        coverage:
+          type: object
+          additionalProperties: false
+          required: [roster_known, reported, roster, profiles, fresh, stale, unavailable, pending, sections]
+          properties:
+            roster_known: { type: boolean }
+            reported: { type: [integer, 'null'], minimum: 0 }
+            roster: { type: integer, minimum: 0, maximum: 1000 }
+            profiles: { type: integer, minimum: 0, maximum: 1000 }
+            fresh: { type: integer, minimum: 0, maximum: 1000 }
+            stale: { type: integer, minimum: 0, maximum: 1000 }
+            unavailable: { type: integer, minimum: 0, maximum: 1000 }
+            pending: { type: integer, minimum: 0, maximum: 1000 }
+            sections:
+              type: object
+              additionalProperties: { type: integer, minimum: 0, maximum: 1000 }
+        classes: { type: array, items: { $ref: '#/components/schemas/Distribution' } }
+        specializations: { type: array, items: { $ref: '#/components/schemas/Distribution' } }
+        roles: { type: array, items: { $ref: '#/components/schemas/Distribution' } }
+        item_level:
+          type: object
+          additionalProperties: false
+          required: [count, mean, median]
+          properties:
+            count: { type: integer, minimum: 0, maximum: 1000 }
+            mean: { $ref: '#/components/schemas/NullableStatValue' }
+            median: { $ref: '#/components/schemas/NullableStatValue' }
+        gear:
+          type: object
+          additionalProperties: false
+          required: [known_enchantments, enchanted, empty_enchantments, unknown_enchantments, known_sets]
+          properties:
+            known_enchantments: { type: integer, minimum: 0, maximum: 100000 }
+            enchanted: { type: integer, minimum: 0, maximum: 100000 }
+            empty_enchantments: { type: integer, minimum: 0, maximum: 100000 }
+            unknown_enchantments: { type: integer, minimum: 0, maximum: 100000 }
+            known_sets: { type: integer, minimum: 0, maximum: 100000 }
+        progress:
+          type: object
+          additionalProperties: false
+          required: [mythic_profiles, raid_profiles]
+          properties:
+            mythic_profiles: { type: integer, minimum: 0, maximum: 1000 }
+            raid_profiles: { type: integer, minimum: 0, maximum: 1000 }
+        members: { type: array, maxItems: 1000, items: { $ref: '#/components/schemas/GuildMemberSummary' } }
+        limitations: { type: array, items: { type: string } }
+    CharacterBundle:
+      type: object
+      additionalProperties: false
+      required: [profile, equipment, statistics, talents, mythic_plus, raids]
+      properties:
+        profile: { $ref: '#/components/schemas/Character' }
+        equipment:
+          anyOf:
+            - $ref: '#/components/schemas/Equipment'
+            - type: 'null'
+        statistics:
+          anyOf:
+            - $ref: '#/components/schemas/Statistics'
+            - type: 'null'
+        talents:
+          anyOf:
+            - $ref: '#/components/schemas/Talents'
+            - type: 'null'
+        mythic_plus:
+          anyOf:
+            - $ref: '#/components/schemas/MythicPlus'
+            - type: 'null'
+        raids:
+          anyOf:
+            - $ref: '#/components/schemas/Raids'
+            - type: 'null'
+    ComparisonEntry:
+      type: object
+      additionalProperties: false
+      required: [key, status, reason, meta, data]
+      properties:
+        key: { $ref: '#/components/schemas/CharacterInput' }
+        status: { type: string, enum: [pending, fresh, stale, unavailable] }
+        reason: { type: [string, 'null'] }
+        meta: { $ref: '#/components/schemas/Meta' }
+        data:
+          anyOf:
+            - $ref: '#/components/schemas/CharacterBundle'
+            - type: 'null'
+    Comparison:
+      type: object
+      additionalProperties: false
+      required: [generated_at, entries, compatibility]
+      properties:
+        generated_at: { type: string, format: date-time }
+        entries: { type: array, minItems: 1, maxItems: 5, items: { $ref: '#/components/schemas/ComparisonEntry' } }
+        compatibility:
+          type: object
+          additionalProperties: false
+          required: [same_patch, same_specialization, mythic_plus_same_season, combat_comparable, reasons]
+          properties:
+            same_patch: { type: [boolean, 'null'] }
+            same_specialization: { type: [boolean, 'null'] }
+            mythic_plus_same_season: { type: [boolean, 'null'] }
+            combat_comparable: { type: boolean, const: false }
+            reasons: { type: array, items: { type: string } }
+    RefreshRequest:
+      type: object
+      additionalProperties: false
+      required: [region, realm, name]
+      properties:
+        region: { $ref: '#/components/schemas/Region' }
+        realm: { type: string, minLength: 1, maxLength: 80 }
+        name: { type: string, minLength: 2, maxLength: 24 }
+        locale: { $ref: '#/components/schemas/Locale' }
+    Job:
+      type: object
+      additionalProperties: false
+      required: [id, kind, status, created_at, updated_at, next_poll_after_seconds, error_code]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [refresh_character, refresh_report, analyze_fight, refresh_guild, refresh_raiderio] }
+        status: { type: string, enum: [queued, running, retry_wait, succeeded, failed, cancelled] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        next_poll_after_seconds:
+          type: [integer, 'null']
+          minimum: 1
+          description: null для terminal state; минимум задержки для queued/running/retry_wait
+        error_code:
+          type: [string, 'null']
+          enum: [null, CHARACTER_UNAVAILABLE, GUILD_UNAVAILABLE, REPORT_UNAVAILABLE, PROVIDER_UNAVAILABLE, PROVIDER_RATE_LIMITED, PROVIDER_INVALID_RESPONSE, PROVIDER_ACCESS_DENIED, PROVIDER_AUTH_FAILURE, INFRASTRUCTURE_UNAVAILABLE, INTERNAL_ERROR, CANCELLED, COMBAT_NOT_CONFIGURED, INVALID_ARGUMENT]
+    CharacterResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data: { $ref: '#/components/schemas/Character' }
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    EquipmentResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data:
+          anyOf:
+            - $ref: '#/components/schemas/Equipment'
+            - type: 'null'
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    StatisticsResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data:
+          anyOf:
+            - $ref: '#/components/schemas/Statistics'
+            - type: 'null'
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    TalentsResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data:
+          anyOf:
+            - $ref: '#/components/schemas/Talents'
+            - type: 'null'
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    MythicPlusResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data:
+          anyOf:
+            - $ref: '#/components/schemas/MythicPlus'
+            - type: 'null'
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    RaidsResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data:
+          anyOf:
+            - $ref: '#/components/schemas/Raids'
+            - type: 'null'
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    PublicReportResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data: { $ref: '#/components/schemas/PublicReport' }
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    ReportFightsResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data: { $ref: '#/components/schemas/ReportFights' }
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    CombatAnalysisResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data: { $ref: '#/components/schemas/CombatAnalysis' }
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    GuildProfileResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data: { $ref: '#/components/schemas/GuildProfile' }
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    GuildRosterResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data: { $ref: '#/components/schemas/GuildRoster' }
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    GuildAnalysisResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data: { $ref: '#/components/schemas/GuildAnalysis' }
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    ComparisonResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data: { $ref: '#/components/schemas/Comparison' }
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    RealmsResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [items, next_cursor]
+          properties:
+            items:
+              type: array
+              maxItems: 100
+              items: { $ref: '#/components/schemas/Realm' }
+            next_cursor: { type: [string, 'null'], maxLength: 1024 }
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    JobResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data: { $ref: '#/components/schemas/Job' }
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }
+    PendingResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data: { type: 'null' }
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/Meta'
+            - type: object
+              properties:
+                status: { const: pending }
+                job_id: { type: string, format: uuid }
+        request_id: { type: string, format: uuid }
+    FreshRefreshResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [disposition, job_id]
+          properties:
+            disposition: { type: string, const: already_fresh }
+            job_id: { type: 'null' }
+        meta:
+          allOf:
+            - $ref: '#/components/schemas/Meta'
+            - type: object
+              properties:
+                source: { const: system }
+                status: { const: fresh }
+                job_id: { type: 'null' }
+        request_id: { type: string, format: uuid }
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error, request_id]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, retryable, retry_after_seconds, job_id, fields]
+          properties:
+            code:
+              type: string
+              enum: [INVALID_ARGUMENT, CHARACTER_UNAVAILABLE, GUILD_UNAVAILABLE, REPORT_UNAVAILABLE, COMBAT_NOT_CONFIGURED, RAIDERIO_NOT_CONFIGURED, REALM_NOT_FOUND, JOB_NOT_FOUND, USER_RATE_LIMITED, REFRESH_COOLDOWN, REQUEST_TOO_LARGE, UNSUPPORTED_MEDIA_TYPE, PROVIDER_INVALID_RESPONSE, PROVIDER_ACCESS_DENIED, PROVIDER_AUTH_FAILURE, PROVIDER_UNAVAILABLE, PROVIDER_RATE_LIMITED, INFRASTRUCTURE_UNAVAILABLE, QUEUE_FULL, INTERNAL_ERROR]
+            message: { type: string, minLength: 1, maxLength: 500 }
+            retryable: { type: boolean }
+            retry_after_seconds: { type: [integer, 'null'], minimum: 1 }
+            job_id: { $ref: '#/components/schemas/NullableUUID' }
+            fields:
+              type: array
+              maxItems: 20
+              items:
+                type: object
+                additionalProperties: false
+                required: [field, reason]
+                properties:
+                  field: { type: string, maxLength: 80 }
+                  reason: { type: string, maxLength: 200 }
+        request_id: { type: string, format: uuid }
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [data, meta, request_id]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [status]
+          properties:
+            status: { type: string, enum: [ok, degraded] }
+        meta: { $ref: '#/components/schemas/Meta' }
+        request_id: { type: string, format: uuid }

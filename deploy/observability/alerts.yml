@@ -1,0 +1,31 @@
+groups:
+  - name: kipet-local-operations
+    rules:
+      - alert: KipetScrapeUnavailable
+        expr: up{job=~"kipet-api|kipet-worker"} == 0
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: Internal metrics unavailable
+          description: Inspect container health and database connectivity before restarting workers.
+      - alert: KipetQueueNotAdvancing
+        expr: kipet_oldest_due_seconds{job="kipet-api"} > 120 or kipet_combat_oldest_due_seconds{job="kipet-api"} > 120 or kipet_guild_oldest_due_seconds{job="kipet-api"} > 120
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: A queue has old unfinished work
+          description: Check provider cooldowns, quotas, expired leases and worker readiness; do not bypass the provider budget.
+      - alert: KipetAPIErrorRate
+        expr: sum(rate(kipet_http_request_duration_seconds_count{job="kipet-api",status=~"5.."}[5m])) / clamp_min(sum(rate(kipet_http_request_duration_seconds_count{job="kipet-api"}[5m])), 0.001) > 0.05
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: API server errors exceed the local warning threshold
+          description: This is an initial alert threshold, not a published service objective.
+      - alert: KipetWorkerStopped
+        expr: kipet_worker_running{job="kipet-worker"} == 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: An expected worker component stopped
+          description: Inspect worker readiness, then queue age and leases.

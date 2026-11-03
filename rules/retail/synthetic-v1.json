@@ -1,0 +1,66 @@
+{
+  "version": "synthetic-1.0.0",
+  "game_flavor": "retail",
+  "patch": "synthetic-demo-v1",
+  "season": null,
+  "class_id": "6",
+  "specialization_id": "251",
+  "content": "general_pve",
+  "synthetic": true,
+  "enabled": true,
+  "review_status": "approved",
+  "reviewed_at": "2026-10-30T00:00:00Z",
+  "reviewed_by": "Local synthetic validation specification",
+  "references": [
+    {
+      "id": "synthetic-spec",
+      "title": "Synthetic algorithm examples; no claim about live World of Warcraft",
+      "url": "urn:kipet:synthetic:retail-v1"
+    }
+  ],
+  "enchant": {
+    "version": "1.0.0",
+    "enabled": true,
+    "reference": "synthetic-spec",
+    "slots": [
+      {"slot":"head","item_ids":["900001000"],"applicable":true,"compatible_enchantment_ids":["900003001"]},
+      {"slot":"neck","item_ids":["900001001"],"applicable":false,"compatible_enchantment_ids":[]},
+      {"slot":"shoulder","item_ids":["900001002"],"applicable":false,"compatible_enchantment_ids":[]},
+      {"slot":"back","item_ids":["900001003"],"applicable":true,"compatible_enchantment_ids":["900003001"]},
+      {"slot":"chest","item_ids":["900001004"],"applicable":false,"compatible_enchantment_ids":[]},
+      {"slot":"wrist","item_ids":["900001005"],"applicable":true,"compatible_enchantment_ids":["900003001"]},
+      {"slot":"hands","item_ids":["900001006"],"applicable":false,"compatible_enchantment_ids":[]},
+      {"slot":"waist","item_ids":["900001007"],"applicable":false,"compatible_enchantment_ids":[]},
+      {"slot":"legs","item_ids":["900001008"],"applicable":false,"compatible_enchantment_ids":[]},
+      {"slot":"feet","item_ids":["900001009"],"applicable":false,"compatible_enchantment_ids":[]},
+      {"slot":"finger_1","item_ids":["900001010"],"applicable":false,"compatible_enchantment_ids":[]},
+      {"slot":"finger_2","item_ids":["900001011"],"applicable":false,"compatible_enchantment_ids":[]},
+      {"slot":"trinket_1","item_ids":["900001012"],"applicable":false,"compatible_enchantment_ids":[]},
+      {"slot":"trinket_2","item_ids":["900001013"],"applicable":false,"compatible_enchantment_ids":[]},
+      {"slot":"main_hand","item_ids":["900001014"],"applicable":false,"compatible_enchantment_ids":[]},
+      {"slot":"off_hand","item_ids":["900001015"],"applicable":false,"compatible_enchantment_ids":[]}
+    ]
+  },
+  "set_bonus": {
+    "version": "1.0.0",
+    "enabled": true,
+    "reference": "synthetic-spec",
+    "sets": [
+      {"set_id":"900002000","item_ids":["900001000","900001002"],"thresholds":[2],"target_pieces":null,"item_count_only":true}
+    ]
+  },
+  "talents": {
+    "version": "1.0.0",
+    "enabled": true,
+    "reference": "synthetic-spec",
+    "tree_hash": "synthetic-tree-v1",
+    "baseline": [
+      {"node_id":"900004001","entry_id":null,"rank":1,"tree":"class"},
+      {"node_id":"900004002","entry_id":null,"rank":1,"tree":"specialization"}
+    ],
+    "alternatives": [
+      {"baseline":{"node_id":"900004002","entry_id":null,"rank":1,"tree":"specialization"},"allowed":[{"node_id":"900004003","entry_id":null,"rank":1,"tree":"specialization"}]}
+    ],
+    "required": []
+  }
+}
